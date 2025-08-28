@@ -55,10 +55,56 @@ unique_ptr<FunctionData> GitTagsBind(ClientContext &context, TableFunctionBindIn
                                     vector<LogicalType> &return_types, vector<string> &names);
 unique_ptr<GlobalTableFunctionState> GitTagsInitGlobal(ClientContext &context, TableFunctionInitInput &input);
 
+// Git tree table function
+struct GitTreeFunctionData : public TableFunctionData {
+    explicit GitTreeFunctionData(const string &ref, const string &repo_path);
+    
+    string ref;
+    string repo_path;
+    vector<struct GitTreeRow> rows;
+    idx_t current_index;
+};
+
+struct GitTreeRow {
+    string path;
+    int32_t mode;
+    string blob_hash;
+    int64_t size;
+};
+
+void GitTreeFunction(ClientContext &context, TableFunctionInput &data_p, DataChunk &output);
+unique_ptr<FunctionData> GitTreeBind(ClientContext &context, TableFunctionBindInput &input,
+                                    vector<LogicalType> &return_types, vector<string> &names);
+unique_ptr<GlobalTableFunctionState> GitTreeInitGlobal(ClientContext &context, TableFunctionInitInput &input);
+
+// Git parents table function
+struct GitParentsFunctionData : public TableFunctionData {
+    explicit GitParentsFunctionData(const string &ref, const string &repo_path, bool all_refs);
+    
+    string ref;
+    string repo_path;
+    bool all_refs;
+    vector<struct GitParentsRow> rows;
+    idx_t current_index;
+};
+
+struct GitParentsRow {
+    string commit_hash;
+    string parent_hash;
+    int32_t parent_index;
+};
+
+void GitParentsFunction(ClientContext &context, TableFunctionInput &data_p, DataChunk &output);
+unique_ptr<FunctionData> GitParentsBind(ClientContext &context, TableFunctionBindInput &input,
+                                       vector<LogicalType> &return_types, vector<string> &names);
+unique_ptr<GlobalTableFunctionState> GitParentsInitGlobal(ClientContext &context, TableFunctionInitInput &input);
+
 // Registration functions
 void RegisterGitLogFunction(DatabaseInstance &db);
 void RegisterGitBranchesFunction(DatabaseInstance &db);  
 void RegisterGitTagsFunction(DatabaseInstance &db);
+void RegisterGitTreeFunction(DatabaseInstance &db);
+void RegisterGitParentsFunction(DatabaseInstance &db);
 void RegisterGitFunctions(DatabaseInstance &db);
 
 } // namespace duckdb

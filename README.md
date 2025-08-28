@@ -41,8 +41,22 @@ FROM git_branches();
 SELECT tag_name, commit_hash, tagger_date 
 FROM git_tags();
 
--- Or specify a different repository path
+-- List all files in a git tree (equivalent to git ls-tree -r --long)
+SELECT path, mode, blob_hash, size 
+FROM git_tree('HEAD');
+
+-- Get commit parent relationships
+SELECT commit_hash, parent_hash, parent_index 
+FROM git_parents('HEAD');
+
+-- Query different repositories by specifying the path
 SELECT * FROM git_log('/path/to/repo');
+SELECT * FROM git_tree('HEAD', '/path/to/repo');
+SELECT * FROM git_parents('HEAD', '/path/to/repo');
+
+-- Use named parameters for clarity
+SELECT * FROM git_tree('HEAD', repo_path := '/path/to/repo');
+SELECT * FROM git_parents('HEAD', repo_path := '/path/to/repo', all_refs := true);
 ```
 
 ### 🔄 Version-Aware Analysis
@@ -166,6 +180,75 @@ GROUP BY author_name
 ORDER BY commit_count DESC;
 ```
 
+### Repository Structure Analysis
+```sql
+-- Analyze repository file structure and sizes
+SELECT 
+    CASE 
+        WHEN path LIKE '%.py' THEN 'Python'
+        WHEN path LIKE '%.js' THEN 'JavaScript'
+        WHEN path LIKE '%.cpp' OR path LIKE '%.hpp' THEN 'C++'
+        ELSE 'Other'
+    END as file_type,
+    COUNT(*) as file_count,
+    SUM(size) as total_size,
+    AVG(size) as avg_file_size
+FROM git_tree('HEAD')
+GROUP BY 1
+ORDER BY total_size DESC;
+
+-- Find largest files in repository
+SELECT path, size, blob_hash
+FROM git_tree('HEAD')
+WHERE size > 100000  -- Files larger than 100KB
+ORDER BY size DESC;
+
+-- Compare file structures across different repositories
+SELECT 
+    'main-repo' as repo_name,
+    COUNT(*) as file_count,
+    SUM(size) as total_size
+FROM git_tree('HEAD', '/path/to/main/repo')
+UNION ALL
+SELECT 
+    'other-repo' as repo_name,
+    COUNT(*) as file_count,
+    SUM(size) as total_size  
+FROM git_tree('HEAD', '/path/to/other/repo');
+```
+
+### Commit Genealogy Analysis  
+```sql
+-- Find merge commits (commits with multiple parents)
+SELECT 
+    p.commit_hash,
+    COUNT(*) as parent_count,
+    g.message,
+    g.author_name
+FROM git_parents('HEAD') p
+JOIN git_log() g ON p.commit_hash = g.commit_hash
+GROUP BY p.commit_hash, g.message, g.author_name
+HAVING COUNT(*) > 1
+ORDER BY parent_count DESC;
+
+-- Trace commit ancestry paths
+WITH RECURSIVE ancestry AS (
+    -- Start from HEAD
+    SELECT commit_hash, parent_hash, 0 as generation
+    FROM git_parents('HEAD') 
+    WHERE parent_index = 0  -- First parent only
+    
+    UNION ALL
+    
+    -- Follow the parent chain
+    SELECT p.commit_hash, p.parent_hash, a.generation + 1
+    FROM git_parents('HEAD') p
+    JOIN ancestry a ON p.commit_hash = a.parent_hash
+    WHERE p.parent_index = 0 AND a.generation < 10  -- Limit depth
+)
+SELECT * FROM ancestry ORDER BY generation;
+```
+
 ### Configuration Drift Detection
 ```sql
 -- Compare configuration files across branches
@@ -203,6 +286,30 @@ LIMIT 10;
 
 ### Advanced Use Cases
 ```sql
+-- Repository evolution: Track how file sizes change over time
+WITH file_history AS (
+    SELECT 
+        p.commit_hash,
+        p.parent_hash,
+        g.author_date,
+        SUM(t.size) as total_repo_size,
+        COUNT(*) as file_count
+    FROM git_parents('HEAD') p
+    JOIN git_log() g ON p.commit_hash = g.commit_hash
+    JOIN git_tree(p.commit_hash) t
+    WHERE p.parent_index = 0  -- First parent only
+    GROUP BY p.commit_hash, p.parent_hash, g.author_date
+)
+SELECT 
+    commit_hash,
+    author_date,
+    total_repo_size,
+    file_count,
+    total_repo_size - LAG(total_repo_size) OVER (ORDER BY author_date) as size_change
+FROM file_history 
+ORDER BY author_date DESC
+LIMIT 10;
+
 -- Find commits that introduced large changes
 SELECT 
     g.commit_hash, 
@@ -214,6 +321,22 @@ CROSS JOIN read_git_diff('git://src/@' || g.commit_hash || '~1',
 WHERE length(r.diff_text) > 1000
 ORDER BY change_size DESC
 LIMIT 5;
+
+-- Cross-reference file changes with commit structure
+SELECT 
+    t.path,
+    t.size,
+    COUNT(p.parent_hash) as times_modified_in_merges
+FROM git_tree('HEAD') t
+LEFT JOIN git_parents('HEAD') p ON EXISTS (
+    SELECT 1 FROM git_tree(p.commit_hash) t2 WHERE t2.path = t.path
+)
+WHERE p.commit_hash IN (
+    SELECT commit_hash FROM git_parents('HEAD') 
+    GROUP BY commit_hash HAVING COUNT(*) > 1  -- Merge commits
+)
+GROUP BY t.path, t.size
+ORDER BY times_modified_in_merges DESC;
 
 -- Compare data schema evolution
 SELECT 
@@ -291,17 +414,18 @@ All new features should include comprehensive tests. Our test suite is designed 
 
 ### ✅ Implemented Features
 - **Git Filesystem**: `git://` protocol implementation with revision support
-- **Table Functions**: Repository metadata access (`git_log`, `git_branches`, `git_tags`)
+- **Table Functions**: Repository metadata access (`git_log`, `git_branches`, `git_tags`, `git_tree`, `git_parents`)
+- **Repository Structure**: File tree exploration and commit genealogy analysis
 - **Text Diff Engine**: Diff computation with multiple output formats
 - **File Integration**: Support for local files, git:// files, and mixed scenarios
 - **Memory Management**: Efficient blob loading with seek operations
 - **Error Handling**: Robust error handling for edge cases
-- **Test Coverage**: 81 comprehensive test assertions across 4 test suites
+- **Test Coverage**: 209 comprehensive test assertions across 5 test suites
 
 ### 📊 Technical Details
-- **4 test suites** with 81 assertions covering all functionality
+- **5 test suites** with 209 assertions covering all functionality
 - **6 core components**: GitFileSystem, GitFileHandle, GitPath, Table Functions, TextDiff, File Integration
-- **12 functions implemented**: git_log, git_branches, git_tags (0 and 1 arg variants), diff_text, text_diff, read_git_diff (1 and 2 arg), text_diff_lines, text_diff_stats
+- **16 functions implemented**: git_log, git_branches, git_tags (0 and 1 arg variants), git_tree, git_parents (0 and 1 arg variants), diff_text, text_diff, read_git_diff (1 and 2 arg), text_diff_lines, text_diff_stats
 - **libgit2 integration** via vcpkg dependency management
 
 ## 📜 License
