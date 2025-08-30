@@ -1028,7 +1028,6 @@ struct GitReadLocalState : public LocalTableFunctionState {
         bool truncated;
         string text;
         string blob;
-        string note;
     };
     
     vector<ReadResult> current_results;
@@ -1130,12 +1129,10 @@ static void ProcessGitURI(const string& uri, const GitReadBindData& bind_data,
     result.truncated = false;
     result.text = "";
     result.blob = "";
-    result.note = "";
     
     string path, commit_hash;
     if (!ParseGitURI(uri, path, commit_hash)) {
-        result.note = "error: invalid git:// URI format";
-        return;
+        throw BinderException("git_read: invalid git:// URI format '%s'", uri);
     }
     
     git_repository *repo = nullptr;
@@ -1148,8 +1145,9 @@ static void ProcessGitURI(const string& uri, const GitReadBindData& bind_data,
         // Open repository
         int error = git_repository_open(&repo, bind_data.repo_path.c_str());
         if (error != 0) {
-            result.note = "error: failed to open repository";
-            return;
+            const git_error *e = git_error_last();
+            throw IOException("git_read: failed to open git repository '%s': %s", 
+                            bind_data.repo_path, e ? e->message : "Unknown error");
         }
         
         // Resolve commit (handle both SHA hashes and references like HEAD)
@@ -1157,9 +1155,10 @@ static void ProcessGitURI(const string& uri, const GitReadBindData& bind_data,
         git_object *obj = nullptr;
         error = git_revparse_single(&obj, repo, commit_hash.c_str());
         if (error != 0) {
-            result.note = "error: failed to resolve commit reference";
+            const git_error *e = git_error_last();
             git_repository_free(repo);
-            return;
+            throw IOException("git_read: failed to resolve commit reference '%s': %s", 
+                            commit_hash, e ? e->message : "Unknown error");
         }
         
         const git_oid *oid = git_object_id(obj);
@@ -1168,28 +1167,29 @@ static void ProcessGitURI(const string& uri, const GitReadBindData& bind_data,
         
         error = git_commit_lookup(&commit, repo, &commit_oid);
         if (error != 0) {
-            result.note = "error: commit not found";
+            const git_error *e = git_error_last();
             git_repository_free(repo);
-            return;
+            throw IOException("git_read: commit not found '%s': %s", 
+                            commit_hash, e ? e->message : "Unknown error");
         }
         
         // Get tree from commit
         error = git_commit_tree(&tree, commit);
         if (error != 0) {
-            result.note = "error: failed to get commit tree";
+            const git_error *e = git_error_last();
             git_commit_free(commit);
             git_repository_free(repo);
-            return;
+            throw IOException("git_read: failed to get commit tree: %s", 
+                            e ? e->message : "Unknown error");
         }
         
         // Find the file in the tree
         error = git_tree_entry_bypath(&entry, tree, path.c_str());
         if (error != 0) {
-            result.note = "error: file not found in tree";
             git_tree_free(tree);
             git_commit_free(commit);
             git_repository_free(repo);
-            return;
+            throw IOException("git_read: file not found '%s' in commit '%s'", path, commit_hash);
         }
         
         // Get file mode and kind
@@ -1206,7 +1206,6 @@ static void ProcessGitURI(const string& uri, const GitReadBindData& bind_data,
                 break;
             case GIT_FILEMODE_TREE:
                 result.kind = "tree";
-                result.note = "trees contain no content";
                 git_tree_entry_free(entry);
                 git_tree_free(tree);
                 git_commit_free(commit);
@@ -1214,32 +1213,30 @@ static void ProcessGitURI(const string& uri, const GitReadBindData& bind_data,
                 return;
             case GIT_FILEMODE_COMMIT:
                 result.kind = "submodule";
-                result.note = "submodules contain no content";
                 git_tree_entry_free(entry);
                 git_tree_free(tree);
                 git_commit_free(commit);
                 git_repository_free(repo);
                 return;
             default:
-                result.kind = "unknown";
-                result.note = "error: unsupported file mode";
                 git_tree_entry_free(entry);
                 git_tree_free(tree);
                 git_commit_free(commit);
                 git_repository_free(repo);
-                return;
+                throw IOException("git_read: unsupported file mode %d", static_cast<int>(filemode));
         }
         
         // Get the blob
         const git_oid *blob_oid = git_tree_entry_id(entry);
         error = git_blob_lookup(&blob, repo, blob_oid);
         if (error != 0) {
-            result.note = "error: failed to load blob";
+            const git_error *e = git_error_last();
             git_tree_entry_free(entry);
             git_tree_free(tree);
             git_commit_free(commit);
             git_repository_free(repo);
-            return;
+            throw IOException("git_read: failed to load blob: %s", 
+                            e ? e->message : "Unknown error");
         }
         
         // Get blob content
@@ -1276,15 +1273,14 @@ static void ProcessGitURI(const string& uri, const GitReadBindData& bind_data,
         git_commit_free(commit);
         git_repository_free(repo);
         
-    } catch (const std::exception& e) {
-        result.note = "error: " + string(e.what());
-        
+    } catch (...) {
         // Clean up on exception
         if (blob) git_blob_free(blob);
         if (entry) git_tree_entry_free(entry);
         if (tree) git_tree_free(tree);
         if (commit) git_commit_free(commit);
         if (repo) git_repository_free(repo);
+        throw; // Re-throw the exception
     }
 }
 
@@ -1327,7 +1323,7 @@ static unique_ptr<FunctionData> GitReadBind(ClientContext &context, TableFunctio
         }
     }
     
-    // Define return schema matching PRD specification
+    // Define return schema
     return_types = {
         LogicalType::VARCHAR,  // uri
         LogicalType::INTEGER,  // mode
@@ -1337,12 +1333,11 @@ static unique_ptr<FunctionData> GitReadBind(ClientContext &context, TableFunctio
         LogicalType::BIGINT,   // size_bytes
         LogicalType::BOOLEAN,  // truncated
         LogicalType::VARCHAR,  // text
-        LogicalType::BLOB,     // blob
-        LogicalType::VARCHAR   // note
+        LogicalType::BLOB      // blob
     };
     
     names = {"uri", "mode", "kind", "is_text", "encoding", "size_bytes", 
-             "truncated", "text", "blob", "note"};
+             "truncated", "text", "blob"};
     
     return make_uniq<GitReadBindData>(max_bytes, decode_base64, transcode, filters, repo_path, uri);
 }
@@ -1387,13 +1382,6 @@ static void GitReadFunction(ClientContext &context, TableFunctionInput &input, D
         FlatVector::SetNull(output.data[8], 0, true);
     }
     
-    if (!result.note.empty()) {
-        FlatVector::GetData<string_t>(output.data[9])[0] = 
-            StringVector::AddString(output.data[9], result.note);
-    } else {
-        FlatVector::SetNull(output.data[9], 0, true);
-    }
-    
     output.SetCardinality(1);
     gstate.finished = true;
 }
@@ -1432,7 +1420,7 @@ static unique_ptr<FunctionData> GitReadEachBind(ClientContext &context, TableFun
         }
     }
     
-    // Define return schema matching PRD specification
+    // Define return schema
     return_types = {
         LogicalType::VARCHAR,  // uri
         LogicalType::INTEGER,  // mode
@@ -1442,12 +1430,11 @@ static unique_ptr<FunctionData> GitReadEachBind(ClientContext &context, TableFun
         LogicalType::BIGINT,   // size_bytes
         LogicalType::BOOLEAN,  // truncated
         LogicalType::VARCHAR,  // text
-        LogicalType::BLOB,     // blob
-        LogicalType::VARCHAR   // note
+        LogicalType::BLOB      // blob
     };
     
     names = {"uri", "mode", "kind", "is_text", "encoding", "size_bytes", 
-             "truncated", "text", "blob", "note"};
+             "truncated", "text", "blob"};
     
     return make_uniq<GitReadBindData>(max_bytes, decode_base64, transcode, filters, repo_path);
 }
@@ -1533,13 +1520,6 @@ static OperatorResultType GitReadEachFunction(ExecutionContext &context, TableFu
                     StringVector::AddStringOrBlob(output.data[8], result.blob);
             } else {
                 FlatVector::SetNull(output.data[8], output_count, true);
-            }
-            
-            if (!result.note.empty()) {
-                FlatVector::GetData<string_t>(output.data[9])[output_count] = 
-                    StringVector::AddString(output.data[9], result.note);
-            } else {
-                FlatVector::SetNull(output.data[9], output_count, true);
             }
             
             output_count++;
