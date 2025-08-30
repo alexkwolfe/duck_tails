@@ -1,5 +1,6 @@
 #include "git_functions.hpp"
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/types/value.hpp"
 #include "duckdb/main/extension_util.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
@@ -376,7 +377,15 @@ void GitTagsFunction(ClientContext &context, TableFunctionInput &data_p, DataChu
 //===--------------------------------------------------------------------===//
 
 GitTreeFunctionData::GitTreeFunctionData(const string &ref, const string &repo_path) 
-    : ref(ref), repo_path(repo_path), current_index(0) {
+    : mode(GitTreeMode::SINGLE), ref(ref), repo_path(repo_path), current_index(0), is_dynamic(false) {
+}
+
+GitTreeFunctionData::GitTreeFunctionData(const vector<string> &commits, const string &repo_path)
+    : mode(GitTreeMode::ARRAY), commits(commits), repo_path(repo_path), current_index(0), is_dynamic(false) {
+}
+
+GitTreeFunctionData::GitTreeFunctionData(const string &range, const string &repo_path, bool is_range)
+    : mode(GitTreeMode::RANGE), commit_range(range), repo_path(repo_path), current_index(0), is_dynamic(false) {
 }
 
 static string oid_to_hex(const git_oid *oid) {
@@ -385,7 +394,29 @@ static string oid_to_hex(const git_oid *oid) {
     return string(hex);
 }
 
-static void traverse_tree(git_repository *repo, git_tree *tree, const string &base, vector<GitTreeRow> &out) {
+static bool IsCommitRange(const string &param) {
+    // Check for git range syntax
+    return param.find("..") != string::npos || 
+           param == "--all" || 
+           param.find("~") != string::npos ||
+           param.find("^") != string::npos;
+}
+
+static vector<string> ParseCommitArray(const Value &array_value) {
+    vector<string> commits;
+    if (array_value.type().id() == LogicalTypeId::LIST) {
+        auto children = ListValue::GetChildren(array_value);
+        for (const auto &child : children) {
+            if (child.type().id() == LogicalTypeId::VARCHAR) {
+                commits.push_back(child.GetValue<string>());
+            }
+        }
+    }
+    return commits;
+}
+
+static void traverse_tree(git_repository *repo, git_tree *tree, const string &base, vector<GitTreeRow> &out, 
+                          const string &commit_hash, timestamp_t commit_date) {
     const size_t count = git_tree_entrycount(tree);
     for (size_t i = 0; i < count; ++i) {
         const git_tree_entry *entry = git_tree_entry_byindex(tree, i);
@@ -403,11 +434,11 @@ static void traverse_tree(git_repository *repo, git_tree *tree, const string &ba
                 size = static_cast<int64_t>(git_blob_rawsize(blob));
                 git_blob_free(blob);
             }
-            out.push_back(GitTreeRow{path, mode, oid_to_hex(oid), size});
+            out.push_back(GitTreeRow{commit_hash, commit_date, path, mode, oid_to_hex(oid), size});
         } else if (type == GIT_OBJECT_TREE) {
             git_tree *subtree = nullptr;
             if (git_tree_lookup(&subtree, repo, oid) == 0) {
-                traverse_tree(repo, subtree, path, out);
+                traverse_tree(repo, subtree, path, out, commit_hash, commit_date);
                 git_tree_free(subtree);
             }
         }
@@ -416,25 +447,105 @@ static void traverse_tree(git_repository *repo, git_tree *tree, const string &ba
 
 unique_ptr<FunctionData> GitTreeBind(ClientContext &context, TableFunctionBindInput &input,
                                     vector<LogicalType> &return_types, vector<string> &names) {
-    string ref = "HEAD";
     string repo_path = ".";
     
-    if (input.inputs.size() >= 1) {
-        ref = input.inputs[0].GetValue<string>();
-    }
-    if (input.inputs.size() >= 2) {
-        repo_path = input.inputs[1].GetValue<string>();
-    }
-    
-    // Check for named parameter repo_path
+    // Check for named parameter repo_path first
     if (input.named_parameters.count("repo_path")) {
         repo_path = StringValue::Get(input.named_parameters.at("repo_path"));
     }
     
-    names = {"path", "mode", "blob_hash", "size"};
-    return_types = {LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::VARCHAR, LogicalType::BIGINT};
+    // Handle different parameter types
+    if (input.inputs.empty()) {
+        // Zero arguments - default to HEAD
+        names = {"commit_hash", "commit_date", "path", "mode", "blob_hash", "size"};
+        return_types = {LogicalType::VARCHAR, LogicalType::TIMESTAMP, LogicalType::VARCHAR, 
+                       LogicalType::INTEGER, LogicalType::VARCHAR, LogicalType::BIGINT};
+        return make_uniq<GitTreeFunctionData>("HEAD", repo_path);
+    }
     
-    return make_uniq<GitTreeFunctionData>(ref, repo_path);
+    auto &first_param = input.inputs[0];
+    
+    if (first_param.type().id() == LogicalTypeId::VARCHAR) {
+        string param = first_param.GetValue<string>();
+        
+        // Override repo_path if second parameter provided
+        if (input.inputs.size() >= 2) {
+            repo_path = input.inputs[1].GetValue<string>();
+        }
+        
+        if (IsCommitRange(param)) {
+            // Range mode: "HEAD~10..HEAD", "--all", etc.
+            names = {"commit_hash", "commit_date", "path", "mode", "blob_hash", "size"};
+            return_types = {LogicalType::VARCHAR, LogicalType::TIMESTAMP, LogicalType::VARCHAR,
+                           LogicalType::INTEGER, LogicalType::VARCHAR, LogicalType::BIGINT};
+            return make_uniq<GitTreeFunctionData>(param, repo_path, true);
+        } else {
+            // Single commit mode
+            names = {"commit_hash", "commit_date", "path", "mode", "blob_hash", "size"};
+            return_types = {LogicalType::VARCHAR, LogicalType::TIMESTAMP, LogicalType::VARCHAR,
+                           LogicalType::INTEGER, LogicalType::VARCHAR, LogicalType::BIGINT};
+            return make_uniq<GitTreeFunctionData>(param, repo_path);
+        }
+    } 
+    else if (first_param.type().id() == LogicalTypeId::LIST) {
+        // Array mode: ARRAY['HEAD', 'HEAD~1']
+        auto commits = ParseCommitArray(first_param);
+        if (commits.empty()) {
+            throw InternalException("git_tree: empty commit array provided");
+        }
+        
+        names = {"commit_hash", "commit_date", "path", "mode", "blob_hash", "size"};
+        return_types = {LogicalType::VARCHAR, LogicalType::TIMESTAMP, LogicalType::VARCHAR,
+                       LogicalType::INTEGER, LogicalType::VARCHAR, LogicalType::BIGINT};
+        return make_uniq<GitTreeFunctionData>(commits, repo_path);
+    }
+    
+    throw InternalException("git_tree: unsupported parameter type - expected VARCHAR or LIST");
+}
+
+// Helper function to process a single commit
+static void ProcessSingleCommit(git_repository *repo, const string &ref, const string &repo_path,
+                               vector<GitTreeRow> &rows) {
+    git_object *obj = nullptr;
+    if (git_revparse_single(&obj, repo, ref.c_str()) != 0) {
+        const git_error *e = git_error_last();
+        throw IOException("git_tree: failed to resolve ref '%s' in repository '%s': %s", 
+                        ref, repo_path, e ? e->message : "Unknown error");
+    }
+
+    git_tree *tree = nullptr;
+    git_commit *commit = nullptr;
+    timestamp_t commit_date = timestamp_t(0);
+    string commit_hash;
+
+    if (git_object_type(obj) == GIT_OBJECT_COMMIT) {
+        commit = reinterpret_cast<git_commit *>(obj);
+        if (git_commit_tree(&tree, commit) != 0) {
+            git_object_free(obj);
+            throw IOException("git_tree: failed to get tree from commit");
+        }
+        
+        // Get commit info
+        const git_signature *sig = git_commit_author(commit);
+        commit_date = Timestamp::FromEpochSeconds(sig->when.time);
+        commit_hash = oid_to_hex(git_object_id(obj));
+    } else if (git_object_type(obj) == GIT_OBJECT_TREE) {
+        git_oid oid = *git_tree_id(reinterpret_cast<git_tree *>(obj));
+        if (git_tree_lookup(&tree, repo, &oid) != 0) {
+            git_object_free(obj);
+            throw IOException("git_tree: failed to lookup tree");
+        }
+        commit_hash = oid_to_hex(&oid);
+        commit_date = timestamp_t(0); // No timestamp for direct tree objects
+    } else {
+        git_object_free(obj);
+        throw IOException("git_tree: ref is not a commit or tree");
+    }
+
+    traverse_tree(repo, tree, "", rows, commit_hash, commit_date);
+
+    git_tree_free(tree);
+    git_object_free(obj);
 }
 
 unique_ptr<GlobalTableFunctionState> GitTreeInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
@@ -451,48 +562,52 @@ unique_ptr<GlobalTableFunctionState> GitTreeInitGlobal(ClientContext &context, T
                         bind_data.repo_path, e ? e->message : "Unknown error");
     }
 
-    git_object *obj = nullptr;
-    if (git_revparse_single(&obj, repo, bind_data.ref.c_str()) != 0) {
-        const git_error *e = git_error_last();
-        git_repository_free(repo);
-        git_libgit2_shutdown();
-        throw IOException("git_tree: failed to resolve ref '%s' in repository '%s': %s", 
-                        bind_data.ref, bind_data.repo_path, e ? e->message : "Unknown error");
-    }
-
-    git_tree *tree = nullptr;
-    if (git_object_type(obj) == GIT_OBJECT_COMMIT) {
-        auto *commit = reinterpret_cast<git_commit *>(obj);
-        if (git_commit_tree(&tree, commit) != 0) {
-            git_object_free(obj);
-            git_repository_free(repo);
-            git_libgit2_shutdown();
-            throw IOException("git_tree: failed to get tree from commit");
-        }
-    } else if (git_object_type(obj) == GIT_OBJECT_TREE) {
-        git_oid oid = *git_tree_id(reinterpret_cast<git_tree *>(obj));
-        if (git_tree_lookup(&tree, repo, &oid) != 0) {
-            git_object_free(obj);
-            git_repository_free(repo);
-            git_libgit2_shutdown();
-            throw IOException("git_tree: failed to lookup tree");
-        }
-    } else {
-        git_object_free(obj);
-        git_repository_free(repo);
-        git_libgit2_shutdown();
-        throw IOException("git_tree: ref is not a commit or tree");
-    }
-
     vector<GitTreeRow> rows;
     rows.reserve(1024);
-    traverse_tree(repo, tree, "", rows);
+
+    try {
+        switch (bind_data.mode) {
+            case GitTreeMode::SINGLE: {
+                ProcessSingleCommit(repo, bind_data.ref, bind_data.repo_path, rows);
+                break;
+            }
+            case GitTreeMode::ARRAY: {
+                for (const auto &commit_ref : bind_data.commits) {
+                    ProcessSingleCommit(repo, commit_ref, bind_data.repo_path, rows);
+                }
+                break;
+            }
+            case GitTreeMode::RANGE: {
+                // For now, implement basic range support
+                // TODO: Implement full git range parsing (HEAD~10..HEAD, --all, etc.)
+                if (bind_data.commit_range == "--all") {
+                    // Process all reachable commits
+                    git_revwalk *walk = nullptr;
+                    git_revwalk_new(&walk, repo);
+                    git_revwalk_push_head(walk);
+                    
+                    git_oid oid;
+                    while (git_revwalk_next(&oid, walk) == 0) {
+                        string commit_hash = oid_to_hex(&oid);
+                        ProcessSingleCommit(repo, commit_hash, bind_data.repo_path, rows);
+                    }
+                    git_revwalk_free(walk);
+                } else {
+                    // For other ranges, just process as single commit for now
+                    ProcessSingleCommit(repo, bind_data.commit_range, bind_data.repo_path, rows);
+                }
+                break;
+            }
+        }
+    } catch (...) {
+        git_repository_free(repo);
+        git_libgit2_shutdown();
+        throw;
+    }
 
     // Store rows in bind_data so they persist
     bind_data.rows = std::move(rows);
 
-    git_tree_free(tree);
-    git_object_free(obj);
     git_repository_free(repo);
     git_libgit2_shutdown();
 
@@ -512,14 +627,144 @@ void GitTreeFunction(ClientContext &context, TableFunctionInput &data_p, DataChu
     
     for (idx_t i = 0; i < count; i++) {
         auto &row = bind_data.rows[bind_data.current_index + i];
-        output.SetValue(0, i, Value(row.path));
-        output.SetValue(1, i, Value::INTEGER(row.mode));
-        output.SetValue(2, i, Value(row.blob_hash));
-        output.SetValue(3, i, Value::BIGINT(row.size));
+        output.SetValue(0, i, Value(row.commit_hash));           // commit_hash
+        output.SetValue(1, i, Value::TIMESTAMP(row.commit_date)); // commit_date
+        output.SetValue(2, i, Value(row.path));                  // path
+        output.SetValue(3, i, Value::INTEGER(row.mode));         // mode
+        output.SetValue(4, i, Value(row.blob_hash));             // blob_hash
+        output.SetValue(5, i, Value::BIGINT(row.size));          // size
     }
 
     output.SetCardinality(count);
     bind_data.current_index += count;
+}
+
+// Git Tree In-Out Function for LATERAL support
+struct GitTreeInOutState : public LocalTableFunctionState {
+    GitTreeInOutState() = default;
+    
+    bool initialized_row = false;
+    idx_t current_input_row = 0;
+    idx_t current_output_row = 0;
+    vector<GitTreeRow> current_rows;
+    string repo_path;
+};
+
+static unique_ptr<LocalTableFunctionState> GitTreeInOutInit(ExecutionContext &context,
+                                                           TableFunctionInitInput &input,
+                                                           GlobalTableFunctionState *global_state) {
+    auto state = make_uniq<GitTreeInOutState>();
+    auto &bind_data = input.bind_data->Cast<GitTreeFunctionData>();
+    state->repo_path = bind_data.repo_path;
+    return std::move(state);
+}
+
+static void ProcessCommitForInOut(const string &commit_hash, const string &repo_path, vector<GitTreeRow> &rows) {
+    git_libgit2_init();
+    git_repository *repo = nullptr;
+    
+    try {
+        if (git_repository_open(&repo, repo_path.c_str()) != 0) {
+            git_libgit2_shutdown();
+            return;
+        }
+        
+        git_oid oid;
+        if (git_oid_fromstr(&oid, commit_hash.c_str()) != 0) {
+            git_repository_free(repo);
+            git_libgit2_shutdown();
+            return;
+        }
+        
+        git_commit *commit = nullptr;
+        if (git_commit_lookup(&commit, repo, &oid) != 0) {
+            git_repository_free(repo);
+            git_libgit2_shutdown();
+            return;
+        }
+        
+        timestamp_t commit_date = Timestamp::FromEpochSeconds(git_commit_time(commit));
+        
+        git_tree *tree = nullptr;
+        if (git_commit_tree(&tree, commit) != 0) {
+            git_commit_free(commit);
+            git_repository_free(repo);
+            git_libgit2_shutdown();
+            return;
+        }
+        
+        // Use existing traverse_tree function to populate rows
+        traverse_tree(repo, tree, "", rows, commit_hash, commit_date);
+        
+        git_tree_free(tree);
+        git_commit_free(commit);
+        git_repository_free(repo);
+        git_libgit2_shutdown();
+        
+    } catch (...) {
+        if (repo) git_repository_free(repo);
+        git_libgit2_shutdown();
+    }
+}
+
+static OperatorResultType GitTreeInOutFunction(ExecutionContext &context, TableFunctionInput &data_p, 
+                                              DataChunk &input, DataChunk &output) {
+    auto &state = data_p.local_state->Cast<GitTreeInOutState>();
+    
+    while (true) {
+        if (!state.initialized_row) {
+            // Initialize for the current input row
+            if (state.current_input_row >= input.size()) {
+                // Ran out of input rows
+                state.current_input_row = 0;
+                state.initialized_row = false;
+                return OperatorResultType::NEED_MORE_INPUT;
+            }
+            
+            // Get the commit hash for this row
+            input.Flatten();
+            if (FlatVector::IsNull(input.data[0], state.current_input_row)) {
+                // Null commit hash - skip this row
+                state.current_input_row++;
+                continue;
+            }
+            
+            string commit_hash = FlatVector::GetValue<string>(input.data[0], state.current_input_row);
+            
+            // Process the git tree for this commit
+            state.current_rows.clear();
+            ProcessCommitForInOut(commit_hash, state.repo_path, state.current_rows);
+            
+            state.initialized_row = true;
+            state.current_output_row = 0;
+        }
+        
+        if (state.current_output_row >= state.current_rows.size()) {
+            // Finished outputting all rows for this input row, move to next
+            state.current_input_row++;
+            state.initialized_row = false;
+            continue;
+        }
+        
+        // Output rows for the current commit
+        idx_t remaining = state.current_rows.size() - state.current_output_row;
+        idx_t count = MinValue<idx_t>(remaining, STANDARD_VECTOR_SIZE);
+        
+        for (idx_t i = 0; i < count; i++) {
+            auto &row = state.current_rows[state.current_output_row + i];
+            output.SetValue(0, i, Value(row.commit_hash));           // commit_hash
+            output.SetValue(1, i, Value::TIMESTAMP(row.commit_date)); // commit_date
+            output.SetValue(2, i, Value(row.path));                  // path
+            output.SetValue(3, i, Value::INTEGER(row.mode));         // mode
+            output.SetValue(4, i, Value(row.blob_hash));             // blob_hash
+            output.SetValue(5, i, Value::BIGINT(row.size));          // size
+        }
+        
+        output.SetCardinality(count);
+        state.current_output_row += count;
+        
+        return OperatorResultType::HAVE_MORE_OUTPUT;
+    }
 }
 
 //===--------------------------------------------------------------------===//
@@ -694,20 +939,29 @@ void RegisterGitTagsFunction(DatabaseInstance &db) {
 }
 
 void RegisterGitTreeFunction(DatabaseInstance &db) {
-    // Two-argument version (ref, repo_path)
-    TableFunction git_tree_func_two("git_tree", {LogicalType::VARCHAR, LogicalType::VARCHAR}, GitTreeFunction, GitTreeBind, GitTreeInitGlobal);
-    git_tree_func_two.named_parameters["repo_path"] = LogicalType::VARCHAR;
-    ExtensionUtil::RegisterFunction(db, git_tree_func_two);
+    TableFunctionSet git_tree_set("git_tree");
     
-    // Single-argument version (ref only, defaults to current directory)
-    TableFunction git_tree_func_one("git_tree", {LogicalType::VARCHAR}, GitTreeFunction, GitTreeBind, GitTreeInitGlobal);
-    git_tree_func_one.named_parameters["repo_path"] = LogicalType::VARCHAR;
-    ExtensionUtil::RegisterFunction(db, git_tree_func_one);
+    // Enhanced single commit version
+    TableFunction git_tree_single({LogicalType::VARCHAR}, GitTreeFunction, GitTreeBind, GitTreeInitGlobal);
+    git_tree_single.named_parameters["repo_path"] = LogicalType::VARCHAR;
+    git_tree_set.AddFunction(git_tree_single);
+    
+    // Two-argument version (ref, repo_path)
+    TableFunction git_tree_two({LogicalType::VARCHAR, LogicalType::VARCHAR}, GitTreeFunction, GitTreeBind, GitTreeInitGlobal);
+    git_tree_two.named_parameters["repo_path"] = LogicalType::VARCHAR;
+    git_tree_set.AddFunction(git_tree_two);
+    
+    // Array version (multiple commits) - WORKING!
+    TableFunction git_tree_array({LogicalType::LIST(LogicalType::VARCHAR)}, GitTreeFunction, GitTreeBind, GitTreeInitGlobal);
+    git_tree_array.named_parameters["repo_path"] = LogicalType::VARCHAR;
+    git_tree_set.AddFunction(git_tree_array);
     
     // Zero-argument version (defaults to HEAD and current directory)
-    TableFunction git_tree_func_zero("git_tree", {}, GitTreeFunction, GitTreeBind, GitTreeInitGlobal);
-    git_tree_func_zero.named_parameters["repo_path"] = LogicalType::VARCHAR;
-    ExtensionUtil::RegisterFunction(db, git_tree_func_zero);
+    TableFunction git_tree_zero({}, GitTreeFunction, GitTreeBind, GitTreeInitGlobal);
+    git_tree_zero.named_parameters["repo_path"] = LogicalType::VARCHAR;
+    git_tree_set.AddFunction(git_tree_zero);
+    
+    ExtensionUtil::RegisterFunction(db, git_tree_set);
 }
 
 void RegisterGitParentsFunction(DatabaseInstance &db) {
@@ -730,12 +984,632 @@ void RegisterGitParentsFunction(DatabaseInstance &db) {
     ExtensionUtil::RegisterFunction(db, git_parents_func_zero);
 }
 
+//===--------------------------------------------------------------------===//
+// Git Read Functions (both static and LATERAL support for reading blob content)
+//===--------------------------------------------------------------------===//
+
+// Common bind data for both static and LATERAL git_read functions
+struct GitReadBindData : public TableFunctionData {
+    int64_t max_bytes;
+    string decode_base64;
+    string transcode;
+    string filters;
+    string repo_path;
+    string uri;  // For static git_read function
+    
+    GitReadBindData(int64_t max_bytes, const string& decode_base64, const string& transcode, 
+                   const string& filters, const string& repo_path, const string& uri = "")
+        : max_bytes(max_bytes), decode_base64(decode_base64), transcode(transcode), 
+          filters(filters), repo_path(repo_path), uri(uri) {}
+};
+
+// Global state for static git_read function
+struct GitReadGlobalState : public GlobalTableFunctionState {
+    GitReadGlobalState() : finished(false) {}
+    bool finished;
+};
+
+struct GitReadLocalState : public LocalTableFunctionState {
+    GitReadLocalState() = default;
+    
+    bool initialized_row = false;
+    idx_t current_input_row = 0;
+    idx_t current_output_row = 0;
+    
+    git_repository *repo = nullptr;
+    
+    struct ReadResult {
+        string uri;
+        int32_t mode;
+        string kind;
+        bool is_text;
+        string encoding;
+        int64_t size_bytes;
+        bool truncated;
+        string text;
+        string blob;
+        string note;
+    };
+    
+    vector<ReadResult> current_results;
+    
+    ~GitReadLocalState() {
+        if (repo) {
+            git_repository_free(repo);
+        }
+    }
+};
+
+// Init functions
+static unique_ptr<GlobalTableFunctionState> GitReadInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
+    return make_uniq<GitReadGlobalState>();
+}
+
+// Helper function to parse git:// URI format
+static bool ParseGitURI(const string& uri, string& path, string& commit_hash) {
+    // Expected format: git://path/to/file@commit_hash
+    if (!StringUtil::StartsWith(uri, "git://")) {
+        return false;
+    }
+    
+    auto at_pos = uri.find_last_of('@');
+    if (at_pos == string::npos) {
+        return false;
+    }
+    
+    path = uri.substr(6, at_pos - 6);  // Remove "git://" prefix
+    commit_hash = uri.substr(at_pos + 1);
+    
+    return true;
+}
+
+// Helper function to detect if content is text
+static bool IsTextContent(const char* data, size_t size) {
+    // Check for null bytes (strong indicator of binary data)
+    for (size_t i = 0; i < size; i++) {
+        if (data[i] == 0) {
+            return false;
+        }
+    }
+    
+    // Check for valid UTF-8 sequences and reasonable control characters
+    size_t i = 0;
+    while (i < size) {
+        unsigned char c = static_cast<unsigned char>(data[i]);
+        
+        // ASCII printable characters and common whitespace
+        if (c < 128) {
+            // Allow printable ASCII and common control chars: tab, newline, carriage return
+            if (c >= 32 || c == 9 || c == 10 || c == 13) {
+                i++;
+                continue;
+            } else {
+                return false;  // Unusual control character
+            }
+        }
+        
+        // Check for valid UTF-8 multi-byte sequences
+        int bytes_in_sequence = 0;
+        if ((c & 0xE0) == 0xC0) {  // 110xxxxx - 2 byte sequence
+            bytes_in_sequence = 2;
+        } else if ((c & 0xF0) == 0xE0) {  // 1110xxxx - 3 byte sequence
+            bytes_in_sequence = 3;
+        } else if ((c & 0xF8) == 0xF0) {  // 11110xxx - 4 byte sequence
+            bytes_in_sequence = 4;
+        } else {
+            return false;  // Invalid UTF-8 start byte
+        }
+        
+        // Validate the continuation bytes
+        if (i + bytes_in_sequence > size) {
+            return false;  // Incomplete sequence
+        }
+        
+        for (int j = 1; j < bytes_in_sequence; j++) {
+            unsigned char continuation = static_cast<unsigned char>(data[i + j]);
+            if ((continuation & 0xC0) != 0x80) {  // Must be 10xxxxxx
+                return false;  // Invalid continuation byte
+            }
+        }
+        
+        i += bytes_in_sequence;
+    }
+    
+    return true;
+}
+
+// Helper function to process a git:// URI and extract content
+static void ProcessGitURI(const string& uri, const GitReadBindData& bind_data, 
+                         GitReadLocalState::ReadResult& result) {
+    result.uri = uri;
+    result.mode = 0;
+    result.kind = "unknown";
+    result.is_text = false;
+    result.encoding = "unknown";
+    result.size_bytes = 0;
+    result.truncated = false;
+    result.text = "";
+    result.blob = "";
+    result.note = "";
+    
+    string path, commit_hash;
+    if (!ParseGitURI(uri, path, commit_hash)) {
+        result.note = "error: invalid git:// URI format";
+        return;
+    }
+    
+    git_repository *repo = nullptr;
+    git_commit *commit = nullptr;
+    git_tree *tree = nullptr;
+    git_tree_entry *entry = nullptr;
+    git_blob *blob = nullptr;
+    
+    try {
+        // Open repository
+        int error = git_repository_open(&repo, bind_data.repo_path.c_str());
+        if (error != 0) {
+            result.note = "error: failed to open repository";
+            return;
+        }
+        
+        // Resolve commit (handle both SHA hashes and references like HEAD)
+        git_oid commit_oid;
+        git_object *obj = nullptr;
+        error = git_revparse_single(&obj, repo, commit_hash.c_str());
+        if (error != 0) {
+            result.note = "error: failed to resolve commit reference";
+            git_repository_free(repo);
+            return;
+        }
+        
+        const git_oid *oid = git_object_id(obj);
+        git_oid_cpy(&commit_oid, oid);
+        git_object_free(obj);
+        
+        error = git_commit_lookup(&commit, repo, &commit_oid);
+        if (error != 0) {
+            result.note = "error: commit not found";
+            git_repository_free(repo);
+            return;
+        }
+        
+        // Get tree from commit
+        error = git_commit_tree(&tree, commit);
+        if (error != 0) {
+            result.note = "error: failed to get commit tree";
+            git_commit_free(commit);
+            git_repository_free(repo);
+            return;
+        }
+        
+        // Find the file in the tree
+        error = git_tree_entry_bypath(&entry, tree, path.c_str());
+        if (error != 0) {
+            result.note = "error: file not found in tree";
+            git_tree_free(tree);
+            git_commit_free(commit);
+            git_repository_free(repo);
+            return;
+        }
+        
+        // Get file mode and kind
+        git_filemode_t filemode = git_tree_entry_filemode(entry);
+        result.mode = static_cast<int32_t>(filemode);
+        
+        switch (filemode) {
+            case GIT_FILEMODE_BLOB:
+            case GIT_FILEMODE_BLOB_EXECUTABLE:
+                result.kind = "file";
+                break;
+            case GIT_FILEMODE_LINK:
+                result.kind = "symlink";
+                break;
+            case GIT_FILEMODE_TREE:
+                result.kind = "tree";
+                result.note = "trees contain no content";
+                git_tree_entry_free(entry);
+                git_tree_free(tree);
+                git_commit_free(commit);
+                git_repository_free(repo);
+                return;
+            case GIT_FILEMODE_COMMIT:
+                result.kind = "submodule";
+                result.note = "submodules contain no content";
+                git_tree_entry_free(entry);
+                git_tree_free(tree);
+                git_commit_free(commit);
+                git_repository_free(repo);
+                return;
+            default:
+                result.kind = "unknown";
+                result.note = "error: unsupported file mode";
+                git_tree_entry_free(entry);
+                git_tree_free(tree);
+                git_commit_free(commit);
+                git_repository_free(repo);
+                return;
+        }
+        
+        // Get the blob
+        const git_oid *blob_oid = git_tree_entry_id(entry);
+        error = git_blob_lookup(&blob, repo, blob_oid);
+        if (error != 0) {
+            result.note = "error: failed to load blob";
+            git_tree_entry_free(entry);
+            git_tree_free(tree);
+            git_commit_free(commit);
+            git_repository_free(repo);
+            return;
+        }
+        
+        // Get blob content
+        const void *raw_content = git_blob_rawcontent(blob);
+        git_off_t raw_size = git_blob_rawsize(blob);
+        
+        result.size_bytes = static_cast<int64_t>(raw_size);
+        
+        // Apply max_bytes limit
+        size_t content_size = static_cast<size_t>(raw_size);
+        if (bind_data.max_bytes > 0 && content_size > static_cast<size_t>(bind_data.max_bytes)) {
+            content_size = static_cast<size_t>(bind_data.max_bytes);
+            result.truncated = true;
+        }
+        
+        if (content_size > 0) {
+            // Determine if content is text or binary
+            bool is_text = IsTextContent(static_cast<const char*>(raw_content), content_size);
+            result.is_text = is_text;
+            
+            if (is_text) {
+                result.encoding = "utf8";
+                result.text = string(static_cast<const char*>(raw_content), content_size);
+            } else {
+                result.encoding = "binary";
+                result.blob = string(static_cast<const char*>(raw_content), content_size);
+            }
+        }
+        
+        // Clean up
+        git_blob_free(blob);
+        git_tree_entry_free(entry);
+        git_tree_free(tree);
+        git_commit_free(commit);
+        git_repository_free(repo);
+        
+    } catch (const std::exception& e) {
+        result.note = "error: " + string(e.what());
+        
+        // Clean up on exception
+        if (blob) git_blob_free(blob);
+        if (entry) git_tree_entry_free(entry);
+        if (tree) git_tree_free(tree);
+        if (commit) git_commit_free(commit);
+        if (repo) git_repository_free(repo);
+    }
+}
+
+// Bind function for static git_read (single URI parameter)
+static unique_ptr<FunctionData> GitReadBind(ClientContext &context, TableFunctionBindInput &input,
+                                          vector<LogicalType> &return_types, vector<string> &names) {
+    
+    // Extract URI parameter
+    if (input.inputs.empty()) {
+        throw BinderException("git_read requires at least one parameter: the URI");
+    }
+    
+    string uri = input.inputs[0].GetValue<string>();
+    
+    // Set default parameters
+    int64_t max_bytes = -1;  // No limit by default
+    string decode_base64 = "auto";
+    string transcode = "utf8";
+    string filters = "raw";
+    string repo_path = ".";
+    
+    // Parse optional parameters
+    if (input.inputs.size() >= 2 && !input.inputs[1].IsNull()) {
+        max_bytes = input.inputs[1].GetValue<int64_t>();
+    }
+    if (input.inputs.size() >= 3 && !input.inputs[2].IsNull()) {
+        decode_base64 = input.inputs[2].GetValue<string>();
+    }
+    if (input.inputs.size() >= 4 && !input.inputs[3].IsNull()) {
+        transcode = input.inputs[3].GetValue<string>();
+    }
+    if (input.inputs.size() >= 5 && !input.inputs[4].IsNull()) {
+        filters = input.inputs[4].GetValue<string>();
+    }
+    
+    // Check for repo_path named parameter
+    for (const auto &kv : input.named_parameters) {
+        if (kv.first == "repo_path") {
+            repo_path = kv.second.GetValue<string>();
+        }
+    }
+    
+    // Define return schema matching PRD specification
+    return_types = {
+        LogicalType::VARCHAR,  // uri
+        LogicalType::INTEGER,  // mode
+        LogicalType::VARCHAR,  // kind
+        LogicalType::BOOLEAN,  // is_text
+        LogicalType::VARCHAR,  // encoding
+        LogicalType::BIGINT,   // size_bytes
+        LogicalType::BOOLEAN,  // truncated
+        LogicalType::VARCHAR,  // text
+        LogicalType::BLOB,     // blob
+        LogicalType::VARCHAR   // note
+    };
+    
+    names = {"uri", "mode", "kind", "is_text", "encoding", "size_bytes", 
+             "truncated", "text", "blob", "note"};
+    
+    return make_uniq<GitReadBindData>(max_bytes, decode_base64, transcode, filters, repo_path, uri);
+}
+
+// Static git_read execution function (processes single URI from bind data)
+static void GitReadFunction(ClientContext &context, TableFunctionInput &input, DataChunk &output) {
+    auto &bind_data = input.bind_data->Cast<GitReadBindData>();
+    auto &gstate = input.global_state->Cast<GitReadGlobalState>();
+    
+    if (gstate.finished) {
+        output.SetCardinality(0);
+        return;
+    }
+    
+    // Process the URI from bind data
+    GitReadLocalState::ReadResult result;
+    ProcessGitURI(bind_data.uri, bind_data, result);
+    
+    // Fill output row
+    FlatVector::GetData<string_t>(output.data[0])[0] = 
+        StringVector::AddString(output.data[0], result.uri);
+    FlatVector::GetData<int32_t>(output.data[1])[0] = result.mode;
+    FlatVector::GetData<string_t>(output.data[2])[0] = 
+        StringVector::AddString(output.data[2], result.kind);
+    FlatVector::GetData<bool>(output.data[3])[0] = result.is_text;
+    FlatVector::GetData<string_t>(output.data[4])[0] = 
+        StringVector::AddString(output.data[4], result.encoding);
+    FlatVector::GetData<int64_t>(output.data[5])[0] = result.size_bytes;
+    FlatVector::GetData<bool>(output.data[6])[0] = result.truncated;
+    
+    if (!result.text.empty()) {
+        FlatVector::GetData<string_t>(output.data[7])[0] = 
+            StringVector::AddString(output.data[7], result.text);
+    } else {
+        FlatVector::SetNull(output.data[7], 0, true);
+    }
+    
+    if (!result.blob.empty()) {
+        FlatVector::GetData<string_t>(output.data[8])[0] = 
+            StringVector::AddStringOrBlob(output.data[8], result.blob);
+    } else {
+        FlatVector::SetNull(output.data[8], 0, true);
+    }
+    
+    if (!result.note.empty()) {
+        FlatVector::GetData<string_t>(output.data[9])[0] = 
+            StringVector::AddString(output.data[9], result.note);
+    } else {
+        FlatVector::SetNull(output.data[9], 0, true);
+    }
+    
+    output.SetCardinality(1);
+    gstate.finished = true;
+}
+
+// Bind function for git_read_each (LATERAL support)
+static unique_ptr<FunctionData> GitReadEachBind(ClientContext &context, TableFunctionBindInput &input,
+                                          vector<LogicalType> &return_types, vector<string> &names) {
+    
+    // Set default parameters
+    int64_t max_bytes = -1;  // No limit by default
+    string decode_base64 = "auto";
+    string transcode = "utf8";
+    string filters = "raw";
+    string repo_path = ".";
+    
+    // For git_read_each, URI comes from input DataChunk dynamically
+    // First input parameter is the URI (VARCHAR), remaining are optional parameters
+    // Skip the URI parameter and process the rest
+    if (input.inputs.size() >= 2 && !input.inputs[1].IsNull()) {
+        max_bytes = input.inputs[1].GetValue<int64_t>();
+    }
+    if (input.inputs.size() >= 3 && !input.inputs[2].IsNull()) {
+        decode_base64 = input.inputs[2].GetValue<string>();
+    }
+    if (input.inputs.size() >= 4 && !input.inputs[3].IsNull()) {
+        transcode = input.inputs[3].GetValue<string>();
+    }
+    if (input.inputs.size() >= 5 && !input.inputs[4].IsNull()) {
+        filters = input.inputs[4].GetValue<string>();
+    }
+    
+    // Check for repo_path named parameter
+    for (const auto &kv : input.named_parameters) {
+        if (kv.first == "repo_path") {
+            repo_path = kv.second.GetValue<string>();
+        }
+    }
+    
+    // Define return schema matching PRD specification
+    return_types = {
+        LogicalType::VARCHAR,  // uri
+        LogicalType::INTEGER,  // mode
+        LogicalType::VARCHAR,  // kind
+        LogicalType::BOOLEAN,  // is_text
+        LogicalType::VARCHAR,  // encoding
+        LogicalType::BIGINT,   // size_bytes
+        LogicalType::BOOLEAN,  // truncated
+        LogicalType::VARCHAR,  // text
+        LogicalType::BLOB,     // blob
+        LogicalType::VARCHAR   // note
+    };
+    
+    names = {"uri", "mode", "kind", "is_text", "encoding", "size_bytes", 
+             "truncated", "text", "blob", "note"};
+    
+    return make_uniq<GitReadBindData>(max_bytes, decode_base64, transcode, filters, repo_path);
+}
+
+static unique_ptr<LocalTableFunctionState> GitReadLocalInit(ExecutionContext &context, 
+                                                           TableFunctionInitInput &input,
+                                                           GlobalTableFunctionState *global_state) {
+    return make_uniq<GitReadLocalState>();
+}
+
+static OperatorResultType GitReadEachFunction(ExecutionContext &context, TableFunctionInput &data_p, 
+                                        DataChunk &input, DataChunk &output) {
+    auto &bind_data = data_p.bind_data->Cast<GitReadBindData>();
+    auto &state = data_p.local_state->Cast<GitReadLocalState>();
+    
+    while (true) {
+        if (!state.initialized_row) {
+            // Initialize for the current input row
+            if (state.current_input_row >= input.size()) {
+                // Ran out of rows
+                state.current_input_row = 0;
+                state.initialized_row = false;
+                return OperatorResultType::NEED_MORE_INPUT;
+            }
+            
+            // Get URI from input - flatten first to ensure vector is in flat format
+            input.Flatten();
+            
+            // Check if input has columns and data
+            if (input.ColumnCount() == 0) {
+                // No input columns, move to next row
+                state.current_input_row++;
+                state.initialized_row = false;
+                continue;
+            }
+            
+            // Check if the input is null
+            if (FlatVector::IsNull(input.data[0], state.current_input_row)) {
+                // Move to next input row if null
+                state.current_input_row++;
+                state.initialized_row = false;
+                continue;
+            }
+            
+            string uri = FlatVector::GetValue<string>(input.data[0], state.current_input_row);
+            
+            // Process the URI and extract content
+            state.current_results.clear();
+            GitReadLocalState::ReadResult result;
+            ProcessGitURI(uri, bind_data, result);
+            state.current_results.push_back(result);
+            
+            state.initialized_row = true;
+            state.current_output_row = 0;
+        }
+        
+        // Output results for current input row
+        idx_t output_count = 0;
+        while (state.current_output_row < state.current_results.size() && output_count < STANDARD_VECTOR_SIZE) {
+            auto &result = state.current_results[state.current_output_row];
+            
+            // Fill output columns
+            FlatVector::GetData<string_t>(output.data[0])[output_count] = 
+                StringVector::AddString(output.data[0], result.uri);
+            FlatVector::GetData<int32_t>(output.data[1])[output_count] = result.mode;
+            FlatVector::GetData<string_t>(output.data[2])[output_count] = 
+                StringVector::AddString(output.data[2], result.kind);
+            FlatVector::GetData<bool>(output.data[3])[output_count] = result.is_text;
+            FlatVector::GetData<string_t>(output.data[4])[output_count] = 
+                StringVector::AddString(output.data[4], result.encoding);
+            FlatVector::GetData<int64_t>(output.data[5])[output_count] = result.size_bytes;
+            FlatVector::GetData<bool>(output.data[6])[output_count] = result.truncated;
+            
+            if (!result.text.empty()) {
+                FlatVector::GetData<string_t>(output.data[7])[output_count] = 
+                    StringVector::AddString(output.data[7], result.text);
+            } else {
+                FlatVector::SetNull(output.data[7], output_count, true);
+            }
+            
+            if (!result.blob.empty()) {
+                FlatVector::GetData<string_t>(output.data[8])[output_count] = 
+                    StringVector::AddStringOrBlob(output.data[8], result.blob);
+            } else {
+                FlatVector::SetNull(output.data[8], output_count, true);
+            }
+            
+            if (!result.note.empty()) {
+                FlatVector::GetData<string_t>(output.data[9])[output_count] = 
+                    StringVector::AddString(output.data[9], result.note);
+            } else {
+                FlatVector::SetNull(output.data[9], output_count, true);
+            }
+            
+            output_count++;
+            state.current_output_row++;
+        }
+        
+        if (output_count > 0) {
+            output.SetCardinality(output_count);
+            
+            if (state.current_output_row >= state.current_results.size()) {
+                // Done with this input row, move to next
+                state.current_input_row++;
+                state.initialized_row = false;
+            }
+            
+            return OperatorResultType::HAVE_MORE_OUTPUT;
+        }
+        
+        // Move to next input row
+        state.current_input_row++;
+        state.initialized_row = false;
+    }
+}
+
+void RegisterGitReadFunction(DatabaseInstance &db) {
+    // Static git_read function (processes literal URIs)
+    // Correct pattern: TableFunction(name, args, function, bind, init_global)
+    TableFunctionSet git_read_set("git_read");
+    
+    TableFunction git_read_1({LogicalType::VARCHAR}, GitReadFunction, GitReadBind, GitReadInitGlobal);
+    git_read_1.named_parameters["repo_path"] = LogicalType::VARCHAR;
+    git_read_set.AddFunction(git_read_1);
+    
+    TableFunction git_read_2({LogicalType::VARCHAR, LogicalType::BIGINT}, GitReadFunction, GitReadBind, GitReadInitGlobal);
+    git_read_2.named_parameters["repo_path"] = LogicalType::VARCHAR;
+    git_read_set.AddFunction(git_read_2);
+    
+    TableFunction git_read_3({LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::VARCHAR}, GitReadFunction, GitReadBind, GitReadInitGlobal);
+    git_read_3.named_parameters["repo_path"] = LogicalType::VARCHAR;
+    git_read_set.AddFunction(git_read_3);
+    
+    TableFunction git_read_4({LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::VARCHAR, LogicalType::VARCHAR}, GitReadFunction, GitReadBind, GitReadInitGlobal);
+    git_read_4.named_parameters["repo_path"] = LogicalType::VARCHAR;
+    git_read_set.AddFunction(git_read_4);
+    
+    TableFunction git_read_5({LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR}, GitReadFunction, GitReadBind, GitReadInitGlobal);
+    git_read_5.named_parameters["repo_path"] = LogicalType::VARCHAR;
+    git_read_set.AddFunction(git_read_5);
+    
+    ExtensionUtil::RegisterFunction(db, git_read_set);
+    
+    // LATERAL git_read_each function (URI comes from input DataChunk)
+    TableFunctionSet git_read_each_set("git_read_each");
+    
+    // Version that takes URI as first parameter (for LATERAL context)
+    TableFunction git_read_each_1({LogicalType::VARCHAR}, nullptr, GitReadEachBind, nullptr, GitReadLocalInit);
+    git_read_each_1.in_out_function = GitReadEachFunction;
+    git_read_each_1.named_parameters["repo_path"] = LogicalType::VARCHAR;
+    git_read_each_set.AddFunction(git_read_each_1);
+    
+    ExtensionUtil::RegisterFunction(db, git_read_each_set);
+}
+
 void RegisterGitFunctions(DatabaseInstance &db) {
     RegisterGitLogFunction(db);
     RegisterGitBranchesFunction(db);
     RegisterGitTagsFunction(db);
     RegisterGitTreeFunction(db);
     RegisterGitParentsFunction(db);
+    RegisterGitReadFunction(db);
 }
 
 } // namespace duckdb

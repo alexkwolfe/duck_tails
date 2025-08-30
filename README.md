@@ -97,7 +97,30 @@ SELECT * FROM read_git_diff('file1.txt', 'file2.txt');
 
 -- Git repository file diffing
 SELECT * FROM read_git_diff('git://README.md@HEAD', 'git://README.md@HEAD~1');
+```
 
+### 📄 Git Content Reading
+Direct access to git blob content with comprehensive metadata:
+
+```sql
+-- Read file content with metadata 
+SELECT uri, is_text, encoding, size_bytes, text 
+FROM git_read('git://README.md@HEAD');
+
+-- Check file type and get content info
+SELECT uri, is_text, size_bytes, 
+       CASE WHEN is_text THEN length(text) ELSE octet_length(blob) END as content_length
+FROM git_read('git://test/data/example.py@HEAD');
+
+-- Read with size limit
+SELECT text FROM git_read('git://README.md@HEAD', 1000);
+
+-- Use named parameters for clarity
+SELECT * FROM git_read('git://test/data/config.json@HEAD', repo_path := '.');
+```
+
+### 🔧 Mixed File System Scenarios
+```sql
 -- Mixed file system scenarios
 SELECT * FROM read_git_diff('local.txt', 'git://file@HEAD');
 
@@ -377,7 +400,7 @@ Duck Tails implements a custom DuckDB FileSystem that intercepts `git://` URLs a
 
 ### ✅ Current Implementation
 - Git filesystem access with git:// protocol support
-- Git repository metadata queries (git_log, git_branches, git_tags)
+- Git repository metadata queries (git_log, git_branches, git_tags, git_read)
 - Text diff analysis with multiple output formats
 - Mixed file system support (local + git:// files)
 
@@ -414,18 +437,18 @@ All new features should include comprehensive tests. Our test suite is designed 
 
 ### ✅ Implemented Features
 - **Git Filesystem**: `git://` protocol implementation with revision support
-- **Table Functions**: Repository metadata access (`git_log`, `git_branches`, `git_tags`, `git_tree`, `git_parents`)
+- **Table Functions**: Repository metadata access (`git_log`, `git_branches`, `git_tags`, `git_tree`, `git_parents`, `git_read`)
 - **Repository Structure**: File tree exploration and commit genealogy analysis
 - **Text Diff Engine**: Diff computation with multiple output formats
 - **File Integration**: Support for local files, git:// files, and mixed scenarios
 - **Memory Management**: Efficient blob loading with seek operations
 - **Error Handling**: Robust error handling for edge cases
-- **Test Coverage**: 209 comprehensive test assertions across 5 test suites
+- **Test Coverage**: 346 comprehensive test assertions across 6 test suites
 
 ### 📊 Technical Details
-- **5 test suites** with 209 assertions covering all functionality
+- **6 test suites** with 346 assertions covering all functionality
 - **6 core components**: GitFileSystem, GitFileHandle, GitPath, Table Functions, TextDiff, File Integration
-- **16 functions implemented**: git_log, git_branches, git_tags (0 and 1 arg variants), git_tree, git_parents (0 and 1 arg variants), diff_text, text_diff, read_git_diff (1 and 2 arg), text_diff_lines, text_diff_stats
+- **17 functions implemented**: git_log, git_branches, git_tags, git_read (0 and 1 arg variants), git_tree, git_parents (0 and 1 arg variants), diff_text, text_diff, read_git_diff (1 and 2 arg), text_diff_lines, text_diff_stats
 - **libgit2 integration** via vcpkg dependency management
 
 ## 📜 License

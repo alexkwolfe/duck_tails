@@ -55,17 +55,32 @@ unique_ptr<FunctionData> GitTagsBind(ClientContext &context, TableFunctionBindIn
                                     vector<LogicalType> &return_types, vector<string> &names);
 unique_ptr<GlobalTableFunctionState> GitTagsInitGlobal(ClientContext &context, TableFunctionInitInput &input);
 
+// Git tree operation modes
+enum class GitTreeMode {
+    SINGLE,    // Single commit (static or dynamic)
+    ARRAY,     // Multiple commits from array
+    RANGE      // Commit range (e.g., HEAD~10..HEAD)
+};
+
 // Git tree table function
 struct GitTreeFunctionData : public TableFunctionData {
     explicit GitTreeFunctionData(const string &ref, const string &repo_path);
+    explicit GitTreeFunctionData(const vector<string> &commits, const string &repo_path);
+    explicit GitTreeFunctionData(const string &range, const string &repo_path, bool is_range);
     
-    string ref;
+    GitTreeMode mode;
+    string ref;                    // For single commit mode
+    vector<string> commits;        // For array mode
+    string commit_range;           // For range mode
     string repo_path;
     vector<struct GitTreeRow> rows;
     idx_t current_index;
+    bool is_dynamic;               // True if parameter comes from LATERAL
 };
 
 struct GitTreeRow {
+    string commit_hash;   // Added for multi-commit support
+    timestamp_t commit_date; // Added context
     string path;
     int32_t mode;
     string blob_hash;
