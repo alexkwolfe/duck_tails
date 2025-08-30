@@ -394,13 +394,13 @@ Duck Tails implements a custom DuckDB FileSystem that intercepts `git://` URLs a
 - **Error Resilient**: Comprehensive error handling for missing repos/revisions
 - **Mixed File Systems**: Support for local + git://, S3 + git://, and other combinations
 - **Zero-Argument Functions**: Clean syntax defaulting to current directory
-- **Test Coverage**: 81 test assertions ensuring functionality
+- **Test Coverage**: 142 test assertions ensuring functionality
 
 ## 🛣️ Roadmap
 
 ### ✅ Current Implementation
 - Git filesystem access with git:// protocol support
-- Git repository metadata queries (git_log, git_branches, git_tags, git_read)
+- Git repository metadata queries (git_log, git_branches, git_tags, git_tree, git_parents, git_read)
 - Text diff analysis with multiple output formats
 - Mixed file system support (local + git:// files)
 
@@ -443,12 +443,12 @@ All new features should include comprehensive tests. Our test suite is designed 
 - **File Integration**: Support for local files, git:// files, and mixed scenarios
 - **Memory Management**: Efficient blob loading with seek operations
 - **Error Handling**: Robust error handling for edge cases
-- **Test Coverage**: 346 comprehensive test assertions across 6 test suites
+- **Test Coverage**: 142 comprehensive test assertions across 7 test suites
 
 ### 📊 Technical Details
-- **6 test suites** with 346 assertions covering all functionality
+- **7 test suites** with 142 assertions covering all functionality
 - **6 core components**: GitFileSystem, GitFileHandle, GitPath, Table Functions, TextDiff, File Integration
-- **17 functions implemented**: git_log, git_branches, git_tags, git_read (0 and 1 arg variants), git_tree, git_parents (0 and 1 arg variants), diff_text, text_diff, read_git_diff (1 and 2 arg), text_diff_lines, text_diff_stats
+- **17 functions implemented**: git_log, git_branches, git_tags, git_read (multiple arg variants), git_tree, git_parents (multiple arg variants), diff_text, text_diff, read_git_diff (1 and 2 arg), text_diff_lines, text_diff_stats
 - **libgit2 integration** via vcpkg dependency management
 
 ## 📜 License
