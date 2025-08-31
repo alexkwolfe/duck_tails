@@ -1386,20 +1386,19 @@ static void GitReadFunction(ClientContext &context, TableFunctionInput &input, D
     gstate.finished = true;
 }
 
-// Bind function for git_read_each (LATERAL support)
+// Bind function for git_read_each (Pure LATERAL function)
 static unique_ptr<FunctionData> GitReadEachBind(ClientContext &context, TableFunctionBindInput &input,
                                           vector<LogicalType> &return_types, vector<string> &names) {
     
-    // Set default parameters
+    // Set default parameters - URI comes from input DataChunk at runtime
     int64_t max_bytes = -1;  // No limit by default
     string decode_base64 = "auto";
     string transcode = "utf8";
     string filters = "raw";
     string repo_path = ".";
     
-    // For git_read_each, URI comes from input DataChunk dynamically
-    // First input parameter is the URI (VARCHAR), remaining are optional parameters
-    // Skip the URI parameter and process the rest
+    // Handle optional parameters (URI is NOT a bind parameter - comes from LATERAL context)
+    // First parameter is URI from LATERAL, so optional params start at index 1
     if (input.inputs.size() >= 2 && !input.inputs[1].IsNull()) {
         max_bytes = input.inputs[1].GetValue<int64_t>();
     }
@@ -1436,7 +1435,8 @@ static unique_ptr<FunctionData> GitReadEachBind(ClientContext &context, TableFun
     names = {"uri", "mode", "kind", "is_text", "encoding", "size_bytes", 
              "truncated", "text", "blob"};
     
-    return make_uniq<GitReadBindData>(max_bytes, decode_base64, transcode, filters, repo_path);
+    // Don't store URI in bind_data - it always comes from input DataChunk for LATERAL functions
+    return make_uniq<GitReadBindData>(max_bytes, decode_base64, transcode, filters, repo_path, "");
 }
 
 static unique_ptr<LocalTableFunctionState> GitReadLocalInit(ExecutionContext &context, 
@@ -1452,23 +1452,20 @@ static OperatorResultType GitReadEachFunction(ExecutionContext &context, TableFu
     
     while (true) {
         if (!state.initialized_row) {
-            // Initialize for the current input row
+            // initialize for the current input row
             if (state.current_input_row >= input.size()) {
-                // Ran out of rows
+                // ran out of rows
                 state.current_input_row = 0;
                 state.initialized_row = false;
                 return OperatorResultType::NEED_MORE_INPUT;
             }
             
-            // Get URI from input - flatten first to ensure vector is in flat format
+            // LATERAL function: ALWAYS extract URI from input DataChunk
             input.Flatten();
             
             // Check if input has columns and data
             if (input.ColumnCount() == 0) {
-                // No input columns, move to next row
-                state.current_input_row++;
-                state.initialized_row = false;
-                continue;
+                throw BinderException("git_read_each: no input columns available");
             }
             
             // Check if the input is null
@@ -1479,7 +1476,19 @@ static OperatorResultType GitReadEachFunction(ExecutionContext &context, TableFu
                 continue;
             }
             
-            string uri = FlatVector::GetValue<string>(input.data[0], state.current_input_row);
+            // Extract URI from input DataChunk - direct string_t access
+            auto data = FlatVector::GetData<string_t>(input.data[0]);
+            if (!data) {
+                throw BinderException("git_read_each: no string data in input column");
+            }
+            
+            // Get the string_t directly and convert to string
+            auto string_t_value = data[state.current_input_row];
+            string uri(string_t_value.GetData(), string_t_value.GetSize());
+            
+            if (uri.empty()) {
+                throw BinderException("git_read_each: received empty URI from input");
+            }
             
             // Process the URI and extract content
             state.current_results.clear();
@@ -1571,7 +1580,7 @@ void RegisterGitReadFunction(DatabaseInstance &db) {
     
     ExtensionUtil::RegisterFunction(db, git_read_set);
     
-    // LATERAL git_read_each function (URI comes from input DataChunk)
+    // LATERAL git_read_each function (URI comes from LATERAL context)
     TableFunctionSet git_read_each_set("git_read_each");
     
     // Version that takes URI as first parameter (for LATERAL context)
@@ -1579,6 +1588,12 @@ void RegisterGitReadFunction(DatabaseInstance &db) {
     git_read_each_1.in_out_function = GitReadEachFunction;
     git_read_each_1.named_parameters["repo_path"] = LogicalType::VARCHAR;
     git_read_each_set.AddFunction(git_read_each_1);
+    
+    // Version with URI and max_bytes parameters
+    TableFunction git_read_each_2({LogicalType::VARCHAR, LogicalType::BIGINT}, nullptr, GitReadEachBind, nullptr, GitReadLocalInit);
+    git_read_each_2.in_out_function = GitReadEachFunction;
+    git_read_each_2.named_parameters["repo_path"] = LogicalType::VARCHAR;
+    git_read_each_set.AddFunction(git_read_each_2);
     
     ExtensionUtil::RegisterFunction(db, git_read_each_set);
 }

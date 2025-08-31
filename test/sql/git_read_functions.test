@@ -50,10 +50,11 @@ SELECT * FROM git_read('git://README.md@HEAD', 1000, 'auto', 'utf8')
 statement ok
 SELECT * FROM git_read('git://README.md@HEAD', 1000, 'auto', 'utf8', 'raw')
 
-# Test git_read_each function with simple input - LATERAL functionality working
-# TODO: Fix git_read_each LATERAL functionality 
-statement ok
-SELECT 1 as placeholder
+# Test git_read_each function with simple input (direct call works)
+query T
+SELECT kind FROM git_read_each('git://README.md@HEAD')
+----
+file
 
 # Verify schema has 9 columns (removed redundant note field)
 query I
@@ -63,6 +64,9 @@ SELECT COUNT(*) FROM (
 ----
 9
 
-# Test that git_read executes properly
+# Test that git_read and git_read_each both execute properly
 statement ok
-SELECT * FROM git_read('git://README.md@HEAD')
+SELECT * FROM git_read('git://README.md@HEAD');
+
+statement ok
+SELECT * FROM git_read_each('git://README.md@HEAD')
