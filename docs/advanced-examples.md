@@ -2,6 +2,54 @@
 
 This document contains advanced usage patterns and complex queries for Duck Tails.
 
+## Directory-Specific File Analysis
+
+```sql
+-- Query all .md files in a specific directory with full content
+SELECT 
+    t.path,
+    t.size,
+    r.is_text,
+    r.encoding,
+    length(r.text) as content_length,
+    r.text as content
+FROM git_tree('HEAD') t,
+     LATERAL git_read_each('git://' || t.path || '@HEAD') r
+WHERE t.path LIKE 'docs/%.md'
+ORDER BY t.path;
+
+-- Find all markdown files across the repository with metadata
+SELECT 
+    t.path,
+    t.size as file_size,
+    r.size_bytes as content_size,
+    CASE 
+        WHEN r.text LIKE '%# %' THEN 'Has H1 headers'
+        WHEN r.text LIKE '%## %' THEN 'Has H2 headers'
+        ELSE 'No clear headers'
+    END as header_analysis,
+    length(r.text) - length(replace(r.text, E'\n', '')) + 1 as line_count
+FROM git_tree('HEAD') t,
+     LATERAL git_read_each('git://' || t.path || '@HEAD') r  
+WHERE t.path LIKE '%.md'
+  AND r.is_text = true
+ORDER BY t.size DESC;
+
+-- Compare documentation files across branches
+SELECT 
+    b.branch_name,
+    COUNT(*) as md_file_count,
+    AVG(length(r.text)) as avg_content_length,
+    SUM(t.size) as total_size
+FROM git_branches() b,
+     LATERAL git_tree(b.branch_name) t,
+     LATERAL git_read_each('git://' || t.path || '@' || b.branch_name) r
+WHERE t.path LIKE '%.md' 
+  AND r.is_text = true
+GROUP BY b.branch_name
+ORDER BY md_file_count DESC;
+```
+
 ## Repository Structure Analysis
 
 ```sql
