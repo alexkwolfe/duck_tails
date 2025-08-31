@@ -2,6 +2,8 @@
 
 This document contains advanced usage patterns and complex queries for Duck Tails.
 
+> **Note**: Only `git_read_each` supports LATERAL joins with dynamic parameters. Other functions like `git_tree`, `git_parents`, `git_log`, etc. require static/literal parameters.
+
 ## Directory-Specific File Analysis
 
 ```sql
@@ -35,18 +37,25 @@ WHERE t.path LIKE '%.md'
   AND r.is_text = true
 ORDER BY t.size DESC;
 
--- Compare documentation files across branches
+-- Compare documentation files across branches (using static branch names)
+WITH branch_files AS (
+  SELECT 'main' as branch_name, t.path, t.size
+  FROM git_tree('main') t
+  WHERE t.path LIKE '%.md'
+  UNION ALL
+  SELECT 'develop' as branch_name, t.path, t.size  
+  FROM git_tree('develop') t
+  WHERE t.path LIKE '%.md'
+)
 SELECT 
-    b.branch_name,
+    bf.branch_name,
     COUNT(*) as md_file_count,
     AVG(length(r.text)) as avg_content_length,
-    SUM(t.size) as total_size
-FROM git_branches() b,
-     LATERAL git_tree(b.branch_name) t,
-     LATERAL git_read_each('git://' || t.path || '@' || b.branch_name) r
-WHERE t.path LIKE '%.md' 
-  AND r.is_text = true
-GROUP BY b.branch_name
+    SUM(bf.size) as total_size
+FROM branch_files bf,
+     LATERAL git_read_each('git://' || bf.path || '@' || bf.branch_name) r
+WHERE r.is_text = true
+GROUP BY bf.branch_name
 ORDER BY md_file_count DESC;
 ```
 
