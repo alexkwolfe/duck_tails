@@ -44,6 +44,26 @@ GitPath GitPath::Parse(const string &git_url) {
         result.revision = "HEAD";
     }
     
+    // Parse range notation in revision (e.g., "v1.0..v2.0", "HEAD~5...HEAD")
+    result.is_range = false;
+    result.is_three_dot = false;
+    size_t three_dot_pos = result.revision.find("...");
+    size_t two_dot_pos = result.revision.find("..");
+    
+    if (three_dot_pos != string::npos) {
+        // Three-dot range: "start...end" 
+        result.is_range = true;
+        result.is_three_dot = true;
+        result.range_start = result.revision.substr(0, three_dot_pos);
+        result.range_end = result.revision.substr(three_dot_pos + 3);
+    } else if (two_dot_pos != string::npos) {
+        // Two-dot range: "start..end"
+        result.is_range = true;
+        result.is_three_dot = false;
+        result.range_start = result.revision.substr(0, two_dot_pos);
+        result.range_end = result.revision.substr(two_dot_pos + 2);
+    }
+    
     // Parse repository path and file path - use discovery for ALL paths
     if (url.empty()) {
         result.repository_path = ".";

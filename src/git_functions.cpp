@@ -454,8 +454,22 @@ static vector<string> ParseCommitArray(const Value &array_value) {
     return commits;
 }
 
+// Helper function to construct git:// URI for a file
+static string BuildGitFileUri(const string &repo_path, const string &file_path, const string &commit_hash) {
+    string uri = "git://" + repo_path;
+    if (!file_path.empty()) {
+        // Add separator if repo_path doesn't end with / and file_path doesn't start with /
+        if (!repo_path.empty() && repo_path.back() != '/' && file_path[0] != '/') {
+            uri += "/";
+        }
+        uri += file_path;
+    }
+    uri += "@" + commit_hash;
+    return uri;
+}
+
 static void traverse_tree(git_repository *repo, git_tree *tree, const string &base, vector<GitTreeRow> &out, 
-                          const string &commit_hash, timestamp_t commit_date) {
+                          const string &commit_hash, timestamp_t commit_date, const string &repo_path) {
     const size_t count = git_tree_entrycount(tree);
     for (size_t i = 0; i < count; ++i) {
         const git_tree_entry *entry = git_tree_entry_byindex(tree, i);
@@ -473,11 +487,12 @@ static void traverse_tree(git_repository *repo, git_tree *tree, const string &ba
                 size = static_cast<int64_t>(git_blob_rawsize(blob));
                 git_blob_free(blob);
             }
-            out.push_back(GitTreeRow{commit_hash, commit_date, path, mode, oid_to_hex(oid), size});
+            string git_file_uri = BuildGitFileUri(repo_path, path, commit_hash);
+            out.push_back(GitTreeRow{commit_hash, commit_date, path, mode, oid_to_hex(oid), size, git_file_uri});
         } else if (type == GIT_OBJECT_TREE) {
             git_tree *subtree = nullptr;
             if (git_tree_lookup(&subtree, repo, oid) == 0) {
-                traverse_tree(repo, subtree, path, out, commit_hash, commit_date);
+                traverse_tree(repo, subtree, path, out, commit_hash, commit_date, repo_path);
                 git_tree_free(subtree);
             }
         }
@@ -496,9 +511,9 @@ unique_ptr<FunctionData> GitTreeBind(ClientContext &context, TableFunctionBindIn
     // Handle different parameter types
     if (input.inputs.empty()) {
         // Zero arguments - default to HEAD
-        names = {"commit_hash", "commit_date", "path", "mode", "blob_hash", "size"};
+        names = {"commit_hash", "commit_date", "path", "mode", "blob_hash", "size", "git_file_uri"};
         return_types = {LogicalType::VARCHAR, LogicalType::TIMESTAMP, LogicalType::VARCHAR, 
-                       LogicalType::INTEGER, LogicalType::VARCHAR, LogicalType::BIGINT};
+                       LogicalType::INTEGER, LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::VARCHAR};
         return make_uniq<GitTreeFunctionData>("HEAD", repo_path);
     }
     
@@ -514,15 +529,15 @@ unique_ptr<FunctionData> GitTreeBind(ClientContext &context, TableFunctionBindIn
         
         if (IsCommitRange(param)) {
             // Range mode: "HEAD~10..HEAD", "--all", etc.
-            names = {"commit_hash", "commit_date", "path", "mode", "blob_hash", "size"};
+            names = {"commit_hash", "commit_date", "path", "mode", "blob_hash", "size", "git_file_uri"};
             return_types = {LogicalType::VARCHAR, LogicalType::TIMESTAMP, LogicalType::VARCHAR,
-                           LogicalType::INTEGER, LogicalType::VARCHAR, LogicalType::BIGINT};
+                           LogicalType::INTEGER, LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::VARCHAR};
             return make_uniq<GitTreeFunctionData>(param, repo_path, true);
         } else {
             // Single commit mode
-            names = {"commit_hash", "commit_date", "path", "mode", "blob_hash", "size"};
+            names = {"commit_hash", "commit_date", "path", "mode", "blob_hash", "size", "git_file_uri"};
             return_types = {LogicalType::VARCHAR, LogicalType::TIMESTAMP, LogicalType::VARCHAR,
-                           LogicalType::INTEGER, LogicalType::VARCHAR, LogicalType::BIGINT};
+                           LogicalType::INTEGER, LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::VARCHAR};
             return make_uniq<GitTreeFunctionData>(param, repo_path);
         }
     } 
@@ -533,9 +548,9 @@ unique_ptr<FunctionData> GitTreeBind(ClientContext &context, TableFunctionBindIn
             throw InternalException("git_tree: empty commit array provided");
         }
         
-        names = {"commit_hash", "commit_date", "path", "mode", "blob_hash", "size"};
+        names = {"commit_hash", "commit_date", "path", "mode", "blob_hash", "size", "git_file_uri"};
         return_types = {LogicalType::VARCHAR, LogicalType::TIMESTAMP, LogicalType::VARCHAR,
-                       LogicalType::INTEGER, LogicalType::VARCHAR, LogicalType::BIGINT};
+                       LogicalType::INTEGER, LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::VARCHAR};
         return make_uniq<GitTreeFunctionData>(commits, repo_path);
     }
     
@@ -581,7 +596,7 @@ static void ProcessSingleCommit(git_repository *repo, const string &ref, const s
         throw IOException("git_tree: ref is not a commit or tree");
     }
 
-    traverse_tree(repo, tree, "", rows, commit_hash, commit_date);
+    traverse_tree(repo, tree, "", rows, commit_hash, commit_date, repo_path);
 
     git_tree_free(tree);
     git_object_free(obj);
@@ -672,6 +687,7 @@ void GitTreeFunction(ClientContext &context, TableFunctionInput &data_p, DataChu
         output.SetValue(3, i, Value::INTEGER(row.mode));         // mode
         output.SetValue(4, i, Value(row.blob_hash));             // blob_hash
         output.SetValue(5, i, Value::BIGINT(row.size));          // size
+        output.SetValue(6, i, Value(row.git_file_uri));          // git_file_uri
     }
 
     output.SetCardinality(count);
@@ -733,7 +749,7 @@ static void ProcessCommitForInOut(const string &commit_hash, const string &repo_
         }
         
         // Use existing traverse_tree function to populate rows
-        traverse_tree(repo, tree, "", rows, commit_hash, commit_date);
+        traverse_tree(repo, tree, "", rows, commit_hash, commit_date, repo_path);
         
         git_tree_free(tree);
         git_commit_free(commit);
@@ -797,6 +813,7 @@ static OperatorResultType GitTreeInOutFunction(ExecutionContext &context, TableF
             output.SetValue(3, i, Value::INTEGER(row.mode));         // mode
             output.SetValue(4, i, Value(row.blob_hash));             // blob_hash
             output.SetValue(5, i, Value::BIGINT(row.size));          // size
+            output.SetValue(6, i, Value(row.git_file_uri));          // git_file_uri
         }
         
         output.SetCardinality(count);
@@ -1004,21 +1021,18 @@ void RegisterGitTreeFunction(DatabaseInstance &db) {
 }
 
 void RegisterGitParentsFunction(DatabaseInstance &db) {
-    // Two-argument version (ref, repo_path)
-    TableFunction git_parents_func_two("git_parents", {LogicalType::VARCHAR, LogicalType::VARCHAR}, GitParentsFunction, GitParentsBind, GitParentsInitGlobal);
-    git_parents_func_two.named_parameters["repo_path"] = LogicalType::VARCHAR;
-    git_parents_func_two.named_parameters["all_refs"] = LogicalType::BOOLEAN;
-    ExtensionUtil::RegisterFunction(db, git_parents_func_two);
-    
-    // Single-argument version (ref only, defaults to current directory)
+    // Single-argument version (ref only, for current directory)
     TableFunction git_parents_func_one("git_parents", {LogicalType::VARCHAR}, GitParentsFunction, GitParentsBind, GitParentsInitGlobal);
-    git_parents_func_one.named_parameters["repo_path"] = LogicalType::VARCHAR;
     git_parents_func_one.named_parameters["all_refs"] = LogicalType::BOOLEAN;
     ExtensionUtil::RegisterFunction(db, git_parents_func_one);
     
+    // Array version (multiple commits) - for consistency with git_tree
+    TableFunction git_parents_func_array("git_parents", {LogicalType::LIST(LogicalType::VARCHAR)}, GitParentsFunction, GitParentsBind, GitParentsInitGlobal);
+    git_parents_func_array.named_parameters["all_refs"] = LogicalType::BOOLEAN;
+    ExtensionUtil::RegisterFunction(db, git_parents_func_array);
+    
     // Zero-argument version (defaults to HEAD and current directory)
     TableFunction git_parents_func_zero("git_parents", {}, GitParentsFunction, GitParentsBind, GitParentsInitGlobal);
-    git_parents_func_zero.named_parameters["repo_path"] = LogicalType::VARCHAR;
     git_parents_func_zero.named_parameters["all_refs"] = LogicalType::BOOLEAN;
     ExtensionUtil::RegisterFunction(db, git_parents_func_zero);
 }
@@ -1637,6 +1651,64 @@ void RegisterGitReadFunction(DatabaseInstance &db) {
     ExtensionUtil::RegisterFunction(db, git_read_each_set);
 }
 
+//===--------------------------------------------------------------------===//
+// git_uri() Scalar Function - Helper for URI construction
+//===--------------------------------------------------------------------===//
+
+static void GitUriFunction(DataChunk &args, ExpressionState &state, Vector &result) {
+    auto &repo_path_vector = args.data[0];
+    auto &file_path_vector = args.data[1]; 
+    auto &commit_ref_vector = args.data[2];
+    
+    UnifiedVectorFormat repo_path_format, file_path_format, commit_ref_format;
+    repo_path_vector.ToUnifiedFormat(args.size(), repo_path_format);
+    file_path_vector.ToUnifiedFormat(args.size(), file_path_format);
+    commit_ref_vector.ToUnifiedFormat(args.size(), commit_ref_format);
+    
+    auto repo_path_data = UnifiedVectorFormat::GetData<string_t>(repo_path_format);
+    auto file_path_data = UnifiedVectorFormat::GetData<string_t>(file_path_format);
+    auto commit_ref_data = UnifiedVectorFormat::GetData<string_t>(commit_ref_format);
+    
+    auto result_data = FlatVector::GetData<string_t>(result);
+    for (idx_t i = 0; i < args.size(); i++) {
+        auto repo_idx = repo_path_format.sel->get_index(i);
+        auto file_idx = file_path_format.sel->get_index(i);
+        auto commit_idx = commit_ref_format.sel->get_index(i);
+        
+        if (!repo_path_format.validity.RowIsValid(repo_idx) || 
+            !file_path_format.validity.RowIsValid(file_idx) ||
+            !commit_ref_format.validity.RowIsValid(commit_idx)) {
+            FlatVector::SetNull(result, i, true);
+            continue;
+        }
+        
+        string repo_path = repo_path_data[repo_idx].GetString();
+        string file_path = file_path_data[file_idx].GetString();  
+        string commit_ref = commit_ref_data[commit_idx].GetString();
+        
+        // Construct git:// URI: git://<repo_path>/<file_path>@<commit_ref>
+        string uri = "git://" + repo_path;
+        if (!file_path.empty()) {
+            // Add separator if repo_path doesn't end with / and file_path doesn't start with /
+            if (!repo_path.empty() && repo_path.back() != '/' && file_path[0] != '/') {
+                uri += "/";
+            }
+            uri += file_path;
+        }
+        uri += "@" + commit_ref;
+        
+        result_data[i] = StringVector::AddString(result, uri);
+    }
+}
+
+static void RegisterGitUriFunction(DatabaseInstance &db) {
+    auto git_uri_func = ScalarFunction("git_uri",
+        {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
+        LogicalType::VARCHAR,
+        GitUriFunction);
+    ExtensionUtil::RegisterFunction(db, git_uri_func);
+}
+
 void RegisterGitFunctions(DatabaseInstance &db) {
     RegisterGitLogFunction(db);
     RegisterGitBranchesFunction(db);
@@ -1644,6 +1716,7 @@ void RegisterGitFunctions(DatabaseInstance &db) {
     RegisterGitTreeFunction(db);
     RegisterGitParentsFunction(db);
     RegisterGitReadFunction(db);
+    RegisterGitUriFunction(db);
 }
 
 } // namespace duckdb

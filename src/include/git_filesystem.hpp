@@ -14,6 +14,12 @@ struct GitPath {
     string file_path;       // Path within repo (can include glob patterns)
     string revision;        // Branch, tag, commit hash, or range
     
+    // Range support fields
+    bool is_range;          // True if revision contains range notation (..)
+    string range_start;     // Start of range (e.g., "v1.0" in "v1.0..v2.0")
+    string range_end;       // End of range (e.g., "v2.0" in "v1.0..v2.0")  
+    bool is_three_dot;      // True for "..." syntax, false for ".." syntax
+    
     static GitPath Parse(const string &git_url);
     string ToString() const;
 };

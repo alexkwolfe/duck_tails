@@ -88,6 +88,7 @@ struct GitTreeRow {
     int32_t mode;
     string blob_hash;
     int64_t size;
+    string git_file_uri;  // Ready-to-use git:// URI for this file
 };
 
 void GitTreeFunction(ClientContext &context, TableFunctionInput &data_p, DataChunk &output);
@@ -98,10 +99,13 @@ unique_ptr<GlobalTableFunctionState> GitTreeInitGlobal(ClientContext &context, T
 // Git parents table function
 struct GitParentsFunctionData : public TableFunctionData {
     explicit GitParentsFunctionData(const string &ref, const string &repo_path, bool all_refs);
+    explicit GitParentsFunctionData(const vector<string> &commits, const string &repo_path, bool all_refs);
     
-    string ref;
+    string ref;                    // For single commit mode
+    vector<string> commits;        // For array mode  
     string repo_path;
     bool all_refs;
+    bool is_array_mode;
     vector<struct GitParentsRow> rows;
     idx_t current_index;
 };
