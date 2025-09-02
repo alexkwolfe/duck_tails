@@ -23,6 +23,52 @@ unique_ptr<FunctionData> GitLogBind(ClientContext &context, TableFunctionBindInp
                                    vector<LogicalType> &return_types, vector<string> &names);
 unique_ptr<GlobalTableFunctionState> GitLogInitGlobal(ClientContext &context, TableFunctionInitInput &input);
 
+// Git log row structure for LATERAL processing
+struct GitLogRow {
+    string repo_path;
+    string commit_hash;
+    string author_name;
+    string author_email;
+    string committer_name;
+    string committer_email;
+    timestamp_t author_date;
+    timestamp_t commit_date;
+    string message;
+    uint32_t parent_count;
+    string tree_hash;
+};
+
+// Local state for git_log_each LATERAL processing
+struct GitLogLocalState : public LocalTableFunctionState {
+    vector<GitLogRow> current_rows;
+    idx_t current_input_row = 0;
+    idx_t current_output_row = 0;  
+    bool initialized_row = false;
+};
+
+// Local init for git_log_each  
+unique_ptr<LocalTableFunctionState> GitLogLocalInit(ExecutionContext &context, TableFunctionInitInput &input, GlobalTableFunctionState *global_state);
+
+// Git branches row structure for LATERAL processing
+struct GitBranchesRow {
+    string repo_path;
+    string branch_name;
+    string commit_hash;
+    bool is_current;
+    bool is_remote;
+};
+
+// Local state for git_branches_each LATERAL processing
+struct GitBranchesLocalState : public LocalTableFunctionState {
+    vector<GitBranchesRow> current_rows;
+    idx_t current_input_row = 0;
+    idx_t current_output_row = 0;
+    bool initialized_row = false;
+};
+
+// Local init for git_branches_each
+unique_ptr<LocalTableFunctionState> GitBranchesLocalInit(ExecutionContext &context, TableFunctionInitInput &input, GlobalTableFunctionState *global_state);
+
 // Git branches table function  
 struct GitBranchesFunctionData : public TableFunctionData {
     explicit GitBranchesFunctionData(const string &repo_path, const string &resolved_repo_path);
@@ -39,6 +85,28 @@ void GitBranchesFunction(ClientContext &context, TableFunctionInput &data_p, Dat
 unique_ptr<FunctionData> GitBranchesBind(ClientContext &context, TableFunctionBindInput &input,
                                         vector<LogicalType> &return_types, vector<string> &names);
 unique_ptr<GlobalTableFunctionState> GitBranchesInitGlobal(ClientContext &context, TableFunctionInitInput &input);
+
+// Git tags row structure for LATERAL processing
+struct GitTagsRow {
+    string repo_path;
+    string tag_name;
+    string commit_hash;
+    string tagger_name;
+    timestamp_t tagger_date;
+    string message;
+    bool is_annotated;
+};
+
+// Local state for git_tags_each LATERAL processing
+struct GitTagsLocalState : public LocalTableFunctionState {
+    vector<GitTagsRow> current_rows;
+    idx_t current_input_row = 0;
+    idx_t current_output_row = 0;
+    bool initialized_row = false;
+};
+
+// Local init for git_tags_each
+unique_ptr<LocalTableFunctionState> GitTagsLocalInit(ExecutionContext &context, TableFunctionInitInput &input, GlobalTableFunctionState *global_state);
 
 // Git tags table function
 struct GitTagsFunctionData : public TableFunctionData {

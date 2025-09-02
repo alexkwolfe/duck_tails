@@ -1,0 +1,89 @@
+# name: test/sql/git_tree_each_comprehensive.test
+# description: Comprehensive tests for git_tree_each LATERAL functionality  
+# group: [duck_tails]
+
+require duck_tails
+
+statement ok
+PRAGMA enable_verification
+
+# Test direct git_tree_each calls (basic functionality)
+query T
+SELECT COUNT(*) > 0 as has_files FROM git_tree_each('HEAD')
+----
+true
+
+# Test git_tree_each schema consistency (should have 7 columns including git_file_uri)
+query I
+SELECT COUNT(*) FROM (
+  DESCRIBE (SELECT * FROM git_tree_each('HEAD'))
+)
+----
+7
+
+# Test git_tree_each return columns match expected schema
+statement ok
+SELECT commit_hash, commit_date, path, mode, blob_hash, size, git_file_uri
+FROM git_tree_each('HEAD') LIMIT 1
+
+# Test LATERAL git_tree_each with single commit
+query TT  
+WITH test_commits AS (SELECT 'HEAD' as commit_ref)
+SELECT t.commit_ref, COUNT(*) > 0 as has_files FROM test_commits t, LATERAL git_tree_each(t.commit_ref) r
+GROUP BY t.commit_ref
+----
+HEAD	true
+
+# Test LATERAL git_tree_each with multiple commits
+query TT
+WITH test_commits(commit_ref) AS (
+    VALUES ('HEAD'), ('HEAD~1') 
+)
+SELECT t.commit_ref, COUNT(*) > 0 as has_files 
+FROM test_commits t, LATERAL git_tree_each(t.commit_ref) r
+GROUP BY t.commit_ref
+ORDER BY t.commit_ref
+----
+HEAD	true
+HEAD~1	true
+
+# Test git_tree_each with invalid commit returns no rows  
+query I
+SELECT COUNT(*) FROM git_tree_each('invalid_commit_hash_that_does_not_exist')
+----
+0
+
+# Test LATERAL git_tree_each with NULL commit (should skip NULL, process HEAD)
+query I
+WITH test_commits(commit_ref) AS (
+    VALUES ('HEAD'), (NULL)
+)
+SELECT COUNT(*) FROM test_commits t, LATERAL git_tree_each(t.commit_ref) r
+----
+52
+
+# Test git_tree_each with named parameters
+query T
+SELECT COUNT(*) > 0 as has_files FROM git_tree_each('HEAD', repo_path := '.')
+----
+true
+
+# Test git_tree zero-argument version (defaults to HEAD) - git_tree_each doesn't support zero-arg
+query T
+SELECT COUNT(*) > 0 as has_files FROM git_tree()
+----
+true
+
+# Test git_tree array version (git_tree_each array is for LATERAL context)
+query T
+SELECT COUNT(*) > 0 as has_files FROM git_tree(ARRAY['HEAD'])
+----
+true
+
+# Test git_file_uri column format
+query T
+SELECT git_file_uri LIKE 'git://./%@%' as correct_format 
+FROM git_tree_each('HEAD') 
+WHERE path = 'README.md'
+----
+true

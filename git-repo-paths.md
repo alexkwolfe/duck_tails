@@ -646,3 +646,74 @@ The implementation is complete and production-ready:
 - Creates confusing error messages ("could not find repository" vs "no git repository found")
 - Simplifies codebase by removing complex fallback paths
 - Exception: Keep simple relative file paths working within current repo
+
+### Decision 5: Unified Function Parameter Design
+**Date**: Current session  
+**Decision**: Standardize all git function signatures to `func(repo_path_or_uri, [optional_params...])`  
+**Problem Solved**: Inconsistent parameter ordering across git functions
+- git_log(repo_path) ✓ - consistent
+- git_branches(repo_path) ✓ - consistent  
+- git_tags(repo_path) ✓ - consistent
+- git_tree(ref, repo_path) ✗ - inconsistent parameter order
+- git_parents(ref, repo_path) ✗ - inconsistent parameter order
+- git_read(uri, max_bytes, ...) ✓ - but needs repo discovery integration
+
+**Rationale**: 
+- **Consistent parameter order**: Source (repo_path_or_uri) always first, options second
+- **Leverages existing repo discovery**: GitPath::Parse already handles both filesystem paths and git:// URIs
+- **Eliminates parameter ambiguity**: Clear which parameter is source vs options  
+- **Unified interface**: Same pattern for all functions simplifies mental model
+
+**New Unified Signatures**:
+```sql
+-- Repository-level functions (no file path in URI)
+git_log(repo_path_or_uri, [optional_ref])
+git_branches(repo_path_or_uri, [optional_ref])  
+git_tags(repo_path_or_uri, [optional_ref])
+git_tree(repo_path_or_uri, [optional_ref])      -- CHANGED: was (ref, repo_path)
+git_parents(repo_path_or_uri, [optional_ref])   -- CHANGED: was (ref, repo_path)
+
+-- File-level function (file path included in URI/path)
+git_read(repo_path_or_uri_with_file, [optional_ref], [max_bytes], [other_options])  -- CHANGED: now supports filesystem paths
+```
+
+**Examples**:
+```sql
+-- Filesystem paths (assume current branch/HEAD)
+git_tree('/path/to/repo')              -- uses HEAD/current branch
+git_parents('/path/to/repo')           -- uses HEAD/current branch  
+git_read('/path/to/repo/subdir/file.txt')  -- uses HEAD/current branch
+
+-- Filesystem paths with explicit ref
+git_tree('/path/to/repo', 'v1.0.0')
+git_parents('/path/to/repo', 'main')
+git_read('/path/to/repo/subdir/file.txt', 'develop')
+
+-- git:// URIs (ref embedded in URI)  
+git_tree('git://repo@v1.0.0')
+git_parents('git://repo@main')
+git_read('git://repo/subdir/file.txt@develop')
+
+-- Error cases (conflicting refs)
+git_tree('git://repo@v1.0.0', 'main')     -- ERROR: conflicting ref specifications
+git_parents('git://repo@main', 'develop') -- ERROR: conflicting ref specifications
+```
+
+**Implementation Requirements**:
+1. **Change git_tree signature**: Move from `(ref, repo_path)` to `(repo_path_or_uri, [ref])`
+2. **Change git_parents signature**: Move from `(ref, repo_path)` to `(repo_path_or_uri, [ref])`  
+3. **Enhance git_read**: Support filesystem paths via repo discovery, not just git:// URIs
+4. **Update _each functions**: All _each functions must match their non-_each counterparts
+5. **Add validation**: Error on conflicting refs (URI has @ref but function call also has ref param)
+6. **Maintain backward compatibility**: Existing git:// URI calls continue working
+
+**Breaking Changes**:
+- `git_tree(ref, repo_path)` → `git_tree(repo_path, ref)` - parameter order reversed
+- `git_parents(ref, repo_path)` → `git_parents(repo_path, ref)` - parameter order reversed
+
+**Benefits**:
+- **Consistent mental model**: All functions follow same pattern
+- **Better discoverability**: Users learn one pattern, applies everywhere
+- **Flexible input**: Both filesystem paths and git:// URIs supported universally  
+- **Clear intent**: Source vs options distinction is obvious
+- **Future-proof**: Easy to add new optional parameters without breaking existing patterns

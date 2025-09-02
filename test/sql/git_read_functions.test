@@ -45,7 +45,7 @@ statement ok
 SELECT * FROM git_read('git://README.md@HEAD', 1000, 'auto')
 
 statement ok
-SELECT * FROM ('git://README.md@HEAD', 1000, 'auto', 'utf8')
+SELECT * FROM git_read('git://README.md@HEAD', 1000, 'auto', 'utf8')
 
 statement ok
 SELECT * FROM git_read('git://README.md@HEAD', 1000, 'auto', 'utf8', 'raw')

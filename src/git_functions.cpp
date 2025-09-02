@@ -73,6 +73,18 @@ unique_ptr<GlobalTableFunctionState> GitLogInitGlobal(ClientContext &context, Ta
     return make_uniq<GlobalTableFunctionState>();
 }
 
+unique_ptr<LocalTableFunctionState> GitLogLocalInit(ExecutionContext &context, TableFunctionInitInput &input, GlobalTableFunctionState *global_state) {
+    return make_uniq<GitLogLocalState>();
+}
+
+unique_ptr<LocalTableFunctionState> GitBranchesLocalInit(ExecutionContext &context, TableFunctionInitInput &input, GlobalTableFunctionState *global_state) {
+    return make_uniq<GitBranchesLocalState>();
+}
+
+unique_ptr<LocalTableFunctionState> GitTagsLocalInit(ExecutionContext &context, TableFunctionInitInput &input, GlobalTableFunctionState *global_state) {
+    return make_uniq<GitTagsLocalState>();
+}
+
 void GitLogFunction(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
     auto &data = (GitLogFunctionData &)*data_p.bind_data;
     
@@ -958,6 +970,543 @@ void GitParentsFunction(ClientContext &context, TableFunctionInput &data_p, Data
 // Registration
 //===--------------------------------------------------------------------===//
 
+// Helper function for LATERAL git_log_each processing - processes entire git log for a repository path
+static void ProcessLogCommitForInOut(const string &input_repo_path, const string &bind_repo_path, vector<GitLogRow> &rows) {
+    // Use input_repo_path from LATERAL context, or bind_repo_path as fallback
+    string repo_path = input_repo_path.empty() ? bind_repo_path : input_repo_path;
+    
+    git_libgit2_init();
+    
+    // Use GitPath::Parse to resolve repository path  
+    string resolved_repo_path;
+    try {
+        auto git_path = GitPath::Parse("git://" + repo_path + "@HEAD");  
+        resolved_repo_path = git_path.repository_path;
+    } catch (const std::exception &e) {
+        throw IOException("Failed to resolve repository path '%s': %s", repo_path, e.what());
+    }
+    
+    git_repository *repo = nullptr;
+    int error = git_repository_open(&repo, resolved_repo_path.c_str());
+    if (error != 0) {
+        const git_error *e = git_error_last();
+        throw IOException("Failed to open repository '%s': %s", 
+                        repo_path, e ? e->message : "Unknown error");
+    }
+    
+    // Create revwalk
+    git_revwalk *walker = nullptr;
+    error = git_revwalk_new(&walker, repo);
+    if (error != 0) {
+        git_repository_free(repo);
+        const git_error *e = git_error_last();
+        throw IOException("Failed to create revwalk: %s", e ? e->message : "Unknown error");
+    }
+    
+    // Push HEAD (like git_log does) - process entire log
+    error = git_revwalk_push_head(walker);
+    if (error != 0) {
+        git_revwalk_free(walker);
+        git_repository_free(repo);
+        const git_error *e = git_error_last();
+        throw IOException("Failed to push HEAD: %s", e ? e->message : "Unknown error");
+        return;
+    }
+    
+    // Walk commits
+    git_oid commit_oid;
+    while (git_revwalk_next(&commit_oid, walker) == 0) {
+        git_commit *commit = nullptr;
+        error = git_commit_lookup(&commit, repo, &commit_oid);
+        if (error != 0) {
+            continue; // Skip invalid commits
+        }
+        
+        GitLogRow row;
+        row.repo_path = repo_path;
+        
+        // Get commit hash
+        char hash_str[GIT_OID_HEXSZ + 1];
+        git_oid_tostr(hash_str, sizeof(hash_str), &commit_oid);
+        row.commit_hash = hash_str;
+        
+        // Get author info
+        const git_signature *author = git_commit_author(commit);
+        row.author_name = author->name ? author->name : "";
+        row.author_email = author->email ? author->email : "";
+        
+        // Get committer info
+        const git_signature *committer = git_commit_committer(commit);
+        row.committer_name = committer->name ? committer->name : "";
+        row.committer_email = committer->email ? committer->email : "";
+        
+        // Get timestamps
+        row.author_date = Timestamp::FromEpochSeconds(author->when.time);
+        row.commit_date = Timestamp::FromEpochSeconds(committer->when.time);
+        
+        // Get commit message
+        const char *message = git_commit_message(commit);
+        row.message = message ? message : "";
+        
+        // Get parent count
+        row.parent_count = git_commit_parentcount(commit);
+        
+        // Get tree hash
+        const git_oid *tree_oid = git_commit_tree_id(commit);
+        char tree_hash[GIT_OID_HEXSZ + 1];
+        git_oid_tostr(tree_hash, sizeof(tree_hash), tree_oid);
+        row.tree_hash = tree_hash;
+        
+        rows.push_back(row);
+        git_commit_free(commit);
+    }
+    
+    git_revwalk_free(walker);
+    git_repository_free(repo);
+}
+
+// LATERAL git_log_each function - processes dynamic commit refs
+static OperatorResultType GitLogEachFunction(ExecutionContext &context, TableFunctionInput &data_p, 
+                                           DataChunk &input, DataChunk &output) {
+    auto &bind_data = data_p.bind_data->Cast<GitLogFunctionData>();
+    auto &state = data_p.local_state->Cast<GitLogLocalState>();
+    
+    while (true) {
+        if (!state.initialized_row) {
+            // initialize for the current input row
+            if (state.current_input_row >= input.size()) {
+                // ran out of rows
+                state.current_input_row = 0;
+                state.initialized_row = false;
+                return OperatorResultType::NEED_MORE_INPUT;
+            }
+            
+            // LATERAL function: ALWAYS extract commit ref from input DataChunk
+            input.Flatten();
+            
+            // Check if input has columns and data
+            if (input.ColumnCount() == 0) {
+                throw BinderException("git_log_each: no input columns available");
+            }
+            
+            // Check if the input is null
+            if (FlatVector::IsNull(input.data[0], state.current_input_row)) {
+                // Move to next input row if null
+                state.current_input_row++;
+                state.initialized_row = false;
+                continue;
+            }
+            
+            // Extract commit ref from input DataChunk - direct string_t access
+            auto data = FlatVector::GetData<string_t>(input.data[0]);
+            if (!data) {
+                throw BinderException("git_log_each: no string data in input column");
+            }
+            
+            // Get the string_t directly and convert to string
+            auto string_t_value = data[state.current_input_row];
+            string input_repo_path(string_t_value.GetData(), string_t_value.GetSize());
+            
+            if (input_repo_path.empty()) {
+                throw BinderException("git_log_each: received empty repository path from input");
+            }
+            
+            // Process the git log for this repository using the DRY shared logic
+            state.current_rows.clear();
+            ProcessLogCommitForInOut(input_repo_path, bind_data.repo_path, state.current_rows);
+            
+            state.initialized_row = true;
+            state.current_output_row = 0;
+        }
+        
+        // Output rows for current input
+        idx_t output_count = 0;
+        while (output_count < STANDARD_VECTOR_SIZE && 
+               state.current_output_row < state.current_rows.size()) {
+            
+            auto &row = state.current_rows[state.current_output_row];
+            
+            // Fill output row with git log data
+            output.SetValue(0, output_count, Value(row.repo_path));
+            output.SetValue(1, output_count, Value(row.commit_hash));
+            output.SetValue(2, output_count, Value(row.author_name));  
+            output.SetValue(3, output_count, Value(row.author_email));
+            output.SetValue(4, output_count, Value(row.committer_name));
+            output.SetValue(5, output_count, Value(row.committer_email));
+            output.SetValue(6, output_count, Value::TIMESTAMP(row.author_date));
+            output.SetValue(7, output_count, Value::TIMESTAMP(row.commit_date));
+            output.SetValue(8, output_count, Value(row.message));
+            output.SetValue(9, output_count, Value::INTEGER(row.parent_count));
+            output.SetValue(10, output_count, Value(row.tree_hash));
+            
+            output_count++;
+            state.current_output_row++;
+        }
+        
+        output.SetCardinality(output_count);
+        
+        // Check if we're done with current input row
+        if (state.current_output_row >= state.current_rows.size()) {
+            state.current_input_row++;
+            state.initialized_row = false;
+        }
+        
+        return OperatorResultType::HAVE_MORE_OUTPUT;
+    }
+}
+
+// Helper function for LATERAL git_branches_each processing - processes entire git branches for a repository path
+static void ProcessBranchesForInOut(const string &input_repo_path, const string &bind_repo_path, vector<GitBranchesRow> &rows) {
+    // Use input_repo_path from LATERAL context, or bind_repo_path as fallback
+    string repo_path = input_repo_path.empty() ? bind_repo_path : input_repo_path;
+    
+    // Use GitPath::Parse for repository discovery
+    string resolved_repo_path;
+    try {
+        auto git_path = GitPath::Parse("git://" + repo_path + "@HEAD");
+        resolved_repo_path = git_path.repository_path;
+    } catch (const std::exception &e) {
+        throw IOException("Failed to resolve repository path '%s': %s", repo_path, e.what());
+    }
+    
+    git_repository *repo = nullptr;
+    git_branch_iterator *iterator = nullptr;
+    
+    try {
+        // Open repository
+        int error = git_repository_open(&repo, resolved_repo_path.c_str());
+        if (error != 0) {
+            const git_error *e = git_error_last();
+            throw IOException("Failed to open git repository '%s': %s", 
+                            resolved_repo_path, e ? e->message : "Unknown error");
+        }
+        
+        // Create branch iterator
+        error = git_branch_iterator_new(&iterator, repo, GIT_BRANCH_ALL);
+        if (error != 0) {
+            const git_error *e = git_error_last();
+            throw IOException("Failed to create branch iterator: %s", e ? e->message : "Unknown error");
+        }
+        
+        // Iterate through branches
+        git_reference *ref = nullptr;
+        git_branch_t branch_type;
+        
+        while (git_branch_next(&ref, &branch_type, iterator) == 0) {
+            GitBranchesRow row;
+            row.repo_path = repo_path;
+            
+            // Get branch name
+            const char *branch_name = nullptr;
+            git_branch_name(&branch_name, ref);
+            row.branch_name = branch_name ? branch_name : "";
+            
+            // Get commit hash
+            const git_oid *oid = git_reference_target(ref);
+            if (oid) {
+                char hash_str[GIT_OID_HEXSZ + 1];
+                git_oid_tostr(hash_str, sizeof(hash_str), oid);
+                row.commit_hash = hash_str;
+            } else {
+                row.commit_hash = "";
+            }
+            
+            // Check if current branch
+            row.is_current = (git_branch_is_head(ref) == 1);
+            
+            // Check if remote branch
+            row.is_remote = (branch_type == GIT_BRANCH_REMOTE);
+            
+            rows.push_back(row);
+            
+            git_reference_free(ref);
+            ref = nullptr;
+        }
+        
+    } catch (...) {
+        // Cleanup on exception
+        if (iterator) {
+            git_branch_iterator_free(iterator);
+            iterator = nullptr;
+        }
+        if (repo) {
+            git_repository_free(repo);
+            repo = nullptr;
+        }
+        throw;
+    }
+    
+    // Normal cleanup
+    if (iterator) {
+        git_branch_iterator_free(iterator);
+        iterator = nullptr;
+    }
+    if (repo) {
+        git_repository_free(repo);
+        repo = nullptr;
+    }
+}
+
+// LATERAL git_branches_each function - processes dynamic repository paths
+static OperatorResultType GitBranchesEachFunction(ExecutionContext &context, TableFunctionInput &data_p, 
+                                                 DataChunk &input, DataChunk &output) {
+    auto &bind_data = data_p.bind_data->Cast<GitBranchesFunctionData>();
+    auto &state = data_p.local_state->Cast<GitBranchesLocalState>();
+    
+    while (true) {
+        if (!state.initialized_row) {
+            if (state.current_input_row >= input.size()) {
+                state.current_input_row = 0;
+                state.initialized_row = false;
+                return OperatorResultType::NEED_MORE_INPUT;
+            }
+            
+            input.Flatten();
+            
+            string input_repo_path;
+            if (input.ColumnCount() == 0) {
+                // Zero-argument static call: use bind_data repo_path (defaults to ".")
+                input_repo_path = bind_data.repo_path.empty() ? "." : bind_data.repo_path;
+            } else {
+                // LATERAL call: extract repo_path from input column
+                if (FlatVector::IsNull(input.data[0], state.current_input_row)) {
+                    state.current_input_row++;
+                    state.initialized_row = false;
+                    continue;
+                }
+                
+                auto data = FlatVector::GetData<string_t>(input.data[0]);
+                if (!data) {
+                    throw BinderException("git_branches_each: no string data in input column");
+                }
+                
+                auto string_t_value = data[state.current_input_row];
+                input_repo_path = string(string_t_value.GetData(), string_t_value.GetSize());
+                
+                if (input_repo_path.empty()) {
+                    throw BinderException("git_branches_each: received empty repository path from input");
+                }
+            }
+            
+            state.current_rows.clear();
+            ProcessBranchesForInOut(input_repo_path, bind_data.repo_path, state.current_rows);
+            
+            state.initialized_row = true;
+            state.current_output_row = 0;
+        }
+        
+        idx_t output_count = 0;
+        while (output_count < STANDARD_VECTOR_SIZE && 
+               state.current_output_row < state.current_rows.size()) {
+            
+            auto &row = state.current_rows[state.current_output_row];
+            
+            output.SetValue(0, output_count, Value(row.repo_path));
+            output.SetValue(1, output_count, Value(row.branch_name));
+            output.SetValue(2, output_count, Value(row.commit_hash));
+            output.SetValue(3, output_count, Value(row.is_current));
+            output.SetValue(4, output_count, Value(row.is_remote));
+            
+            output_count++;
+            state.current_output_row++;
+        }
+        
+        output.SetCardinality(output_count);
+        
+        if (state.current_output_row >= state.current_rows.size()) {
+            state.current_input_row++;
+            state.initialized_row = false;
+        }
+        
+        return OperatorResultType::HAVE_MORE_OUTPUT;
+    }
+}
+
+// Helper function for LATERAL git_tags_each processing - processes entire git tags for a repository path  
+static void ProcessTagsForInOut(const string &input_repo_path, const string &bind_repo_path, vector<GitTagsRow> &rows) {
+    // Use input_repo_path from LATERAL context, or bind_repo_path as fallback
+    string repo_path = input_repo_path.empty() ? bind_repo_path : input_repo_path;
+    
+    // Use GitPath::Parse for repository discovery
+    string resolved_repo_path;
+    try {
+        auto git_path = GitPath::Parse("git://" + repo_path + "@HEAD");
+        resolved_repo_path = git_path.repository_path;
+    } catch (const std::exception &e) {
+        throw IOException("Failed to resolve repository path '%s': %s", repo_path, e.what());
+    }
+    
+    git_repository *repo = nullptr;
+    vector<string> tag_names;
+    
+    try {
+        // Open repository
+        int error = git_repository_open(&repo, resolved_repo_path.c_str());
+        if (error != 0) {
+            const git_error *e = git_error_last();
+            throw IOException("Failed to open git repository '%s': %s", 
+                            resolved_repo_path, e ? e->message : "Unknown error");
+        }
+        
+        // Get all tags
+        error = git_tag_foreach(repo, tag_foreach_cb, &tag_names);
+        if (error != 0) {
+            const git_error *e = git_error_last();
+            throw IOException("Failed to list tags: %s", e ? e->message : "Unknown error");
+        }
+        
+        // Process each tag
+        for (const string &tag_name : tag_names) {
+            GitTagsRow row;
+            row.repo_path = repo_path;
+            row.tag_name = tag_name;
+            
+            // Look up tag reference
+            git_reference *tag_ref = nullptr;
+            string full_name = "refs/tags/" + tag_name;
+            error = git_reference_lookup(&tag_ref, repo, full_name.c_str());
+            if (error == 0) {
+                const git_oid *oid = git_reference_target(tag_ref);
+                if (oid) {
+                    char hash_str[GIT_OID_HEXSZ + 1];
+                    git_oid_tostr(hash_str, sizeof(hash_str), oid);
+                    row.commit_hash = hash_str;
+                    
+                    // Try to get tag object for annotation info
+                    git_tag *tag_obj = nullptr;
+                    bool is_annotated = false;
+                    if (git_tag_lookup(&tag_obj, repo, oid) == 0) {
+                        is_annotated = true;
+                        
+                        const git_signature *tagger = git_tag_tagger(tag_obj);
+                        if (tagger) {
+                            row.tagger_name = tagger->name ? tagger->name : "";
+                            row.tagger_date = Timestamp::FromEpochSeconds(tagger->when.time);
+                        } else {
+                            row.tagger_name = "";
+                            row.tagger_date = timestamp_t(0);
+                        }
+                        
+                        const char *message = git_tag_message(tag_obj);
+                        row.message = message ? message : "";
+                        
+                        git_tag_free(tag_obj);
+                        tag_obj = nullptr;
+                    } else {
+                        // Lightweight tag
+                        row.tagger_name = "";
+                        row.tagger_date = timestamp_t(0);
+                        row.message = "";
+                    }
+                    
+                    row.is_annotated = is_annotated;
+                } else {
+                    row.commit_hash = "";
+                    row.tagger_name = "";
+                    row.tagger_date = timestamp_t(0);
+                    row.message = "";
+                    row.is_annotated = false;
+                }
+                
+                rows.push_back(row);
+                git_reference_free(tag_ref);
+                tag_ref = nullptr;
+            }
+        }
+        
+    } catch (...) {
+        // Cleanup on exception
+        if (repo) {
+            git_repository_free(repo);
+            repo = nullptr;
+        }
+        throw;
+    }
+    
+    // Normal cleanup
+    if (repo) {
+        git_repository_free(repo);
+        repo = nullptr;
+    }
+}
+
+// LATERAL git_tags_each function - processes dynamic repository paths
+static OperatorResultType GitTagsEachFunction(ExecutionContext &context, TableFunctionInput &data_p, 
+                                             DataChunk &input, DataChunk &output) {
+    auto &bind_data = data_p.bind_data->Cast<GitTagsFunctionData>();
+    auto &state = data_p.local_state->Cast<GitTagsLocalState>();
+    
+    while (true) {
+        if (!state.initialized_row) {
+            if (state.current_input_row >= input.size()) {
+                state.current_input_row = 0;
+                state.initialized_row = false;
+                return OperatorResultType::NEED_MORE_INPUT;
+            }
+            
+            input.Flatten();
+            
+            string input_repo_path;
+            if (input.ColumnCount() == 0) {
+                // Zero-argument static call: use bind_data repo_path (defaults to ".")
+                input_repo_path = bind_data.repo_path.empty() ? "." : bind_data.repo_path;
+            } else {
+                // LATERAL call: extract repo_path from input column
+                if (FlatVector::IsNull(input.data[0], state.current_input_row)) {
+                    state.current_input_row++;
+                    state.initialized_row = false;
+                    continue;
+                }
+                
+                auto data = FlatVector::GetData<string_t>(input.data[0]);
+                if (!data) {
+                    throw BinderException("git_tags_each: no string data in input column");
+                }
+                
+                auto string_t_value = data[state.current_input_row];
+                input_repo_path = string(string_t_value.GetData(), string_t_value.GetSize());
+                
+                if (input_repo_path.empty()) {
+                    throw BinderException("git_tags_each: received empty repository path from input");
+                }
+            }
+            
+            state.current_rows.clear();
+            ProcessTagsForInOut(input_repo_path, bind_data.repo_path, state.current_rows);
+            
+            state.initialized_row = true;
+            state.current_output_row = 0;
+        }
+        
+        idx_t output_count = 0;
+        while (output_count < STANDARD_VECTOR_SIZE && 
+               state.current_output_row < state.current_rows.size()) {
+            
+            auto &row = state.current_rows[state.current_output_row];
+            
+            output.SetValue(0, output_count, Value(row.repo_path));
+            output.SetValue(1, output_count, Value(row.tag_name));
+            output.SetValue(2, output_count, Value(row.commit_hash));
+            output.SetValue(3, output_count, Value(row.tagger_name));
+            output.SetValue(4, output_count, Value::TIMESTAMP(row.tagger_date));
+            output.SetValue(5, output_count, Value(row.message));
+            output.SetValue(6, output_count, Value(row.is_annotated));
+            
+            output_count++;
+            state.current_output_row++;
+        }
+        
+        output.SetCardinality(output_count);
+        
+        if (state.current_output_row >= state.current_rows.size()) {
+            state.current_input_row++;
+            state.initialized_row = false;
+        }
+        
+        return OperatorResultType::HAVE_MORE_OUTPUT;
+    }
+}
+
 void RegisterGitLogFunction(DatabaseInstance &db) {
     // Single-argument version (existing)
     TableFunction git_log_func("git_log", {LogicalType::VARCHAR}, GitLogFunction, GitLogBind, GitLogInitGlobal);
@@ -968,6 +1517,23 @@ void RegisterGitLogFunction(DatabaseInstance &db) {
     TableFunction git_log_func_zero("git_log", {}, GitLogFunction, GitLogBind, GitLogInitGlobal);
     git_log_func_zero.named_parameters["repo_path"] = LogicalType::VARCHAR;
     ExtensionUtil::RegisterFunction(db, git_log_func_zero);
+    
+    // LATERAL git_log_each function (commit ref comes from LATERAL context) - ONLY for dynamic input
+    TableFunctionSet git_log_each_set("git_log_each");
+    
+    // Version that takes commit ref as first parameter (for LATERAL context)
+    TableFunction git_log_each_single({LogicalType::VARCHAR}, nullptr, GitLogBind, nullptr, GitLogLocalInit);
+    git_log_each_single.in_out_function = GitLogEachFunction;
+    git_log_each_single.named_parameters["repo_path"] = LogicalType::VARCHAR;
+    git_log_each_set.AddFunction(git_log_each_single);
+    
+    // Two-argument version (ref, repo_path)
+    TableFunction git_log_each_two({LogicalType::VARCHAR, LogicalType::VARCHAR}, nullptr, GitLogBind, nullptr, GitLogLocalInit);
+    git_log_each_two.in_out_function = GitLogEachFunction;
+    git_log_each_two.named_parameters["repo_path"] = LogicalType::VARCHAR;
+    git_log_each_set.AddFunction(git_log_each_two);
+    
+    ExtensionUtil::RegisterFunction(db, git_log_each_set);
 }
 
 void RegisterGitBranchesFunction(DatabaseInstance &db) {
@@ -980,6 +1546,29 @@ void RegisterGitBranchesFunction(DatabaseInstance &db) {
     TableFunction git_branches_func_zero("git_branches", {}, GitBranchesFunction, GitBranchesBind, GitBranchesInitGlobal);
     git_branches_func_zero.named_parameters["repo_path"] = LogicalType::VARCHAR;
     ExtensionUtil::RegisterFunction(db, git_branches_func_zero);
+    
+    // LATERAL git_branches_each function (repository path comes from LATERAL context) - ONLY for dynamic input
+    TableFunctionSet git_branches_each_set("git_branches_each");
+    
+    // Zero-argument version (defaults to current directory)
+    TableFunction git_branches_each_zero({}, nullptr, GitBranchesBind, nullptr, GitBranchesLocalInit);
+    git_branches_each_zero.in_out_function = GitBranchesEachFunction;
+    git_branches_each_zero.named_parameters["repo_path"] = LogicalType::VARCHAR;
+    git_branches_each_set.AddFunction(git_branches_each_zero);
+    
+    // Version that takes repository path as first parameter (for LATERAL context)
+    TableFunction git_branches_each_single({LogicalType::VARCHAR}, nullptr, GitBranchesBind, nullptr, GitBranchesLocalInit);
+    git_branches_each_single.in_out_function = GitBranchesEachFunction;
+    git_branches_each_single.named_parameters["repo_path"] = LogicalType::VARCHAR;
+    git_branches_each_set.AddFunction(git_branches_each_single);
+    
+    // Two-argument version (repo_path, repo_path)
+    TableFunction git_branches_each_two({LogicalType::VARCHAR, LogicalType::VARCHAR}, nullptr, GitBranchesBind, nullptr, GitBranchesLocalInit);
+    git_branches_each_two.in_out_function = GitBranchesEachFunction;
+    git_branches_each_two.named_parameters["repo_path"] = LogicalType::VARCHAR;
+    git_branches_each_set.AddFunction(git_branches_each_two);
+    
+    ExtensionUtil::RegisterFunction(db, git_branches_each_set);
 }
 
 void RegisterGitTagsFunction(DatabaseInstance &db) {
@@ -992,6 +1581,157 @@ void RegisterGitTagsFunction(DatabaseInstance &db) {
     TableFunction git_tags_func_zero("git_tags", {}, GitTagsFunction, GitTagsBind, GitTagsInitGlobal);
     git_tags_func_zero.named_parameters["repo_path"] = LogicalType::VARCHAR;
     ExtensionUtil::RegisterFunction(db, git_tags_func_zero);
+    
+    // LATERAL git_tags_each function (repository path comes from LATERAL context) - ONLY for dynamic input
+    TableFunctionSet git_tags_each_set("git_tags_each");
+    
+    // Zero-argument version (defaults to current directory)
+    TableFunction git_tags_each_zero({}, nullptr, GitTagsBind, nullptr, GitTagsLocalInit);
+    git_tags_each_zero.in_out_function = GitTagsEachFunction;
+    git_tags_each_zero.named_parameters["repo_path"] = LogicalType::VARCHAR;
+    git_tags_each_set.AddFunction(git_tags_each_zero);
+    
+    // Version that takes repository path as first parameter (for LATERAL context)
+    TableFunction git_tags_each_single({LogicalType::VARCHAR}, nullptr, GitTagsBind, nullptr, GitTagsLocalInit);
+    git_tags_each_single.in_out_function = GitTagsEachFunction;
+    git_tags_each_single.named_parameters["repo_path"] = LogicalType::VARCHAR;
+    git_tags_each_set.AddFunction(git_tags_each_single);
+    
+    // Two-argument version (repo_path, repo_path)
+    TableFunction git_tags_each_two({LogicalType::VARCHAR, LogicalType::VARCHAR}, nullptr, GitTagsBind, nullptr, GitTagsLocalInit);
+    git_tags_each_two.in_out_function = GitTagsEachFunction;
+    git_tags_each_two.named_parameters["repo_path"] = LogicalType::VARCHAR;
+    git_tags_each_set.AddFunction(git_tags_each_two);
+    
+    ExtensionUtil::RegisterFunction(db, git_tags_each_set);
+}
+
+//===--------------------------------------------------------------------===//
+// Git Tree Each LATERAL Function (for dynamic parameters)
+//===--------------------------------------------------------------------===//
+
+struct GitTreeLocalState : public LocalTableFunctionState {
+    vector<GitTreeRow> current_rows;
+    idx_t current_output_row = 0;
+    idx_t current_input_row = 0;
+    string repo_path;
+    bool initialized_row = false;
+};
+
+static unique_ptr<LocalTableFunctionState> GitTreeLocalInit(ExecutionContext &context,
+                                                           TableFunctionInitInput &input,
+                                                           GlobalTableFunctionState *global_state) {
+    return make_uniq<GitTreeLocalState>();
+}
+
+// Helper function for LATERAL git_tree_each processing
+static void ProcessTreeCommitForInOut(const string &commit_ref, const string &repo_path, vector<GitTreeRow> &rows) {
+    git_libgit2_init();
+    git_repository *repo = nullptr;
+    
+    try {
+        if (git_repository_open(&repo, repo_path.c_str()) != 0) {
+            git_libgit2_shutdown();
+            return;
+        }
+        
+        ProcessSingleCommit(repo, commit_ref, repo_path, rows);
+        git_repository_free(repo);
+    } catch (...) {
+        if (repo) {
+            git_repository_free(repo);
+        }
+    }
+    
+    git_libgit2_shutdown();
+}
+
+static OperatorResultType GitTreeEachFunction(ExecutionContext &context, TableFunctionInput &data_p,
+                                              DataChunk &input, DataChunk &output) {
+    auto &bind_data = data_p.bind_data->Cast<GitTreeFunctionData>();
+    auto &state = data_p.local_state->Cast<GitTreeLocalState>();
+    
+    while (true) {
+        if (!state.initialized_row) {
+            // initialize for the current input row
+            if (state.current_input_row >= input.size()) {
+                // ran out of rows
+                state.current_input_row = 0;
+                state.initialized_row = false;
+                return OperatorResultType::NEED_MORE_INPUT;
+            }
+            
+            // LATERAL function: ALWAYS extract commit ref from input DataChunk
+            input.Flatten();
+            
+            // Check if input has columns and data
+            if (input.ColumnCount() == 0) {
+                throw BinderException("git_tree_each: no input columns available");
+            }
+            
+            // Check if the input is null
+            if (FlatVector::IsNull(input.data[0], state.current_input_row)) {
+                // Move to next input row if null
+                state.current_input_row++;
+                state.initialized_row = false;
+                continue;
+            }
+            
+            // Extract commit ref from input DataChunk - direct string_t access
+            auto data = FlatVector::GetData<string_t>(input.data[0]);
+            if (!data) {
+                throw BinderException("git_tree_each: no string data in input column");
+            }
+            
+            // Get the string_t directly and convert to string
+            auto string_t_value = data[state.current_input_row];
+            string commit_ref(string_t_value.GetData(), string_t_value.GetSize());
+            
+            if (commit_ref.empty()) {
+                throw BinderException("git_tree_each: received empty commit reference from input");
+            }
+            
+            // Process the git tree for this commit using the DRY shared logic
+            state.current_rows.clear();
+            ProcessTreeCommitForInOut(commit_ref, bind_data.repo_path, state.current_rows);
+            
+            state.initialized_row = true;
+            state.current_output_row = 0;
+        }
+        
+        if (state.current_output_row >= state.current_rows.size()) {
+            // Finished outputting all rows for this input row, move to next
+            state.current_input_row++;
+            state.initialized_row = false;
+            continue;
+        }
+        
+        // Output rows for current input
+        idx_t remaining = state.current_rows.size() - state.current_output_row;
+        idx_t count = MinValue<idx_t>(remaining, STANDARD_VECTOR_SIZE);
+        
+        for (idx_t i = 0; i < count; i++) {
+            auto &row = state.current_rows[state.current_output_row + i];
+            output.SetValue(0, i, Value(row.commit_hash));           // commit_hash
+            output.SetValue(1, i, Value::TIMESTAMP(row.commit_date)); // commit_date
+            output.SetValue(2, i, Value(row.path));                  // path
+            output.SetValue(3, i, Value::INTEGER(row.mode));         // mode
+            output.SetValue(4, i, Value(row.blob_hash));             // blob_hash
+            output.SetValue(5, i, Value::BIGINT(row.size));          // size
+            output.SetValue(6, i, Value(row.git_file_uri));          // git_file_uri
+        }
+        
+        output.SetCardinality(count);
+        state.current_output_row += count;
+        
+        if (state.current_output_row >= state.current_rows.size()) {
+            // Finished this input row, setup to move to next
+            state.current_input_row++;
+            state.initialized_row = false;
+        }
+        
+        return OperatorResultType::HAVE_MORE_OUTPUT;
+    }
 }
 
 void RegisterGitTreeFunction(DatabaseInstance &db) {
@@ -1018,6 +1758,29 @@ void RegisterGitTreeFunction(DatabaseInstance &db) {
     git_tree_set.AddFunction(git_tree_zero);
     
     ExtensionUtil::RegisterFunction(db, git_tree_set);
+    
+    // LATERAL git_tree_each function (commit ref comes from LATERAL context) - ONLY for dynamic input
+    TableFunctionSet git_tree_each_set("git_tree_each");
+    
+    // Version that takes commit ref as first parameter (for LATERAL context)
+    TableFunction git_tree_each_single({LogicalType::VARCHAR}, nullptr, GitTreeBind, nullptr, GitTreeLocalInit);
+    git_tree_each_single.in_out_function = GitTreeEachFunction;
+    git_tree_each_single.named_parameters["repo_path"] = LogicalType::VARCHAR;
+    git_tree_each_set.AddFunction(git_tree_each_single);
+    
+    // Two-argument version (ref, repo_path)
+    TableFunction git_tree_each_two({LogicalType::VARCHAR, LogicalType::VARCHAR}, nullptr, GitTreeBind, nullptr, GitTreeLocalInit);
+    git_tree_each_two.in_out_function = GitTreeEachFunction;
+    git_tree_each_two.named_parameters["repo_path"] = LogicalType::VARCHAR;
+    git_tree_each_set.AddFunction(git_tree_each_two);
+    
+    // Array version (multiple commits)
+    TableFunction git_tree_each_array({LogicalType::LIST(LogicalType::VARCHAR)}, nullptr, GitTreeBind, nullptr, GitTreeLocalInit);
+    git_tree_each_array.in_out_function = GitTreeEachFunction;
+    git_tree_each_array.named_parameters["repo_path"] = LogicalType::VARCHAR;
+    git_tree_each_set.AddFunction(git_tree_each_array);
+    
+    ExtensionUtil::RegisterFunction(db, git_tree_each_set);
 }
 
 void RegisterGitParentsFunction(DatabaseInstance &db) {
@@ -1025,6 +1788,11 @@ void RegisterGitParentsFunction(DatabaseInstance &db) {
     TableFunction git_parents_func_one("git_parents", {LogicalType::VARCHAR}, GitParentsFunction, GitParentsBind, GitParentsInitGlobal);
     git_parents_func_one.named_parameters["all_refs"] = LogicalType::BOOLEAN;
     ExtensionUtil::RegisterFunction(db, git_parents_func_one);
+    
+    // Two-parameter version (ref, repo_path)
+    TableFunction git_parents_func_two("git_parents", {LogicalType::VARCHAR, LogicalType::VARCHAR}, GitParentsFunction, GitParentsBind, GitParentsInitGlobal);
+    git_parents_func_two.named_parameters["all_refs"] = LogicalType::BOOLEAN;
+    ExtensionUtil::RegisterFunction(db, git_parents_func_two);
     
     // Array version (multiple commits) - for consistency with git_tree
     TableFunction git_parents_func_array("git_parents", {LogicalType::LIST(LogicalType::VARCHAR)}, GitParentsFunction, GitParentsBind, GitParentsInitGlobal);
@@ -1209,7 +1977,7 @@ static void ProcessGitURI(const string& uri, const GitReadBindData& bind_data,
         error = git_revparse_single(&obj, repo, commit_hash.c_str());
         if (error != 0) {
             const git_error *e = git_error_last();
-            git_repository_free(repo);
+            git_repository_free(repo); repo = nullptr;
             throw IOException("git_read: failed to resolve commit reference '%s': %s", 
                             commit_hash, e ? e->message : "Unknown error");
         }
@@ -1221,7 +1989,7 @@ static void ProcessGitURI(const string& uri, const GitReadBindData& bind_data,
         error = git_commit_lookup(&commit, repo, &commit_oid);
         if (error != 0) {
             const git_error *e = git_error_last();
-            git_repository_free(repo);
+            git_repository_free(repo); repo = nullptr;
             throw IOException("git_read: commit not found '%s': %s", 
                             commit_hash, e ? e->message : "Unknown error");
         }
@@ -1230,8 +1998,8 @@ static void ProcessGitURI(const string& uri, const GitReadBindData& bind_data,
         error = git_commit_tree(&tree, commit);
         if (error != 0) {
             const git_error *e = git_error_last();
-            git_commit_free(commit);
-            git_repository_free(repo);
+            git_commit_free(commit); commit = nullptr;
+            git_repository_free(repo); repo = nullptr;
             throw IOException("git_read: failed to get commit tree: %s", 
                             e ? e->message : "Unknown error");
         }
@@ -1239,9 +2007,9 @@ static void ProcessGitURI(const string& uri, const GitReadBindData& bind_data,
         // Find the file in the tree
         error = git_tree_entry_bypath(&entry, tree, path.c_str());
         if (error != 0) {
-            git_tree_free(tree);
-            git_commit_free(commit);
-            git_repository_free(repo);
+            git_tree_free(tree); tree = nullptr;
+            git_commit_free(commit); commit = nullptr;
+            git_repository_free(repo); repo = nullptr;
             throw IOException("git_read: file not found '%s' in commit '%s'", path, commit_hash);
         }
         
@@ -1259,23 +2027,23 @@ static void ProcessGitURI(const string& uri, const GitReadBindData& bind_data,
                 break;
             case GIT_FILEMODE_TREE:
                 result.kind = "tree";
-                git_tree_entry_free(entry);
-                git_tree_free(tree);
-                git_commit_free(commit);
-                git_repository_free(repo);
+                git_tree_entry_free(entry); entry = nullptr;
+                git_tree_free(tree); tree = nullptr;
+                git_commit_free(commit); commit = nullptr;
+                git_repository_free(repo); repo = nullptr;
                 return;
             case GIT_FILEMODE_COMMIT:
                 result.kind = "submodule";
-                git_tree_entry_free(entry);
-                git_tree_free(tree);
-                git_commit_free(commit);
-                git_repository_free(repo);
+                git_tree_entry_free(entry); entry = nullptr;
+                git_tree_free(tree); tree = nullptr;
+                git_commit_free(commit); commit = nullptr;
+                git_repository_free(repo); repo = nullptr;
                 return;
             default:
-                git_tree_entry_free(entry);
-                git_tree_free(tree);
-                git_commit_free(commit);
-                git_repository_free(repo);
+                git_tree_entry_free(entry); entry = nullptr;
+                git_tree_free(tree); tree = nullptr;
+                git_commit_free(commit); commit = nullptr;
+                git_repository_free(repo); repo = nullptr;
                 throw IOException("git_read: unsupported file mode %d", static_cast<int>(filemode));
         }
         
@@ -1284,10 +2052,10 @@ static void ProcessGitURI(const string& uri, const GitReadBindData& bind_data,
         error = git_blob_lookup(&blob, repo, blob_oid);
         if (error != 0) {
             const git_error *e = git_error_last();
-            git_tree_entry_free(entry);
-            git_tree_free(tree);
-            git_commit_free(commit);
-            git_repository_free(repo);
+            git_tree_entry_free(entry); entry = nullptr;
+            git_tree_free(tree); tree = nullptr;
+            git_commit_free(commit); commit = nullptr;
+            git_repository_free(repo); repo = nullptr;
             throw IOException("git_read: failed to load blob: %s", 
                             e ? e->message : "Unknown error");
         }
@@ -1320,11 +2088,11 @@ static void ProcessGitURI(const string& uri, const GitReadBindData& bind_data,
         }
         
         // Clean up
-        git_blob_free(blob);
-        git_tree_entry_free(entry);
-        git_tree_free(tree);
-        git_commit_free(commit);
-        git_repository_free(repo);
+        git_blob_free(blob); blob = nullptr;
+        git_tree_entry_free(entry); entry = nullptr;
+        git_tree_free(tree); tree = nullptr;
+        git_commit_free(commit); commit = nullptr;
+        git_repository_free(repo); repo = nullptr;
         
     } catch (...) {
         // Clean up on exception
@@ -1656,6 +2424,44 @@ void RegisterGitReadFunction(DatabaseInstance &db) {
 //===--------------------------------------------------------------------===//
 
 static void GitUriFunction(DataChunk &args, ExpressionState &state, Vector &result) {
+    // Handle case where all inputs are constant - create constant output
+    if (args.data[0].GetVectorType() == VectorType::CONSTANT_VECTOR &&
+        args.data[1].GetVectorType() == VectorType::CONSTANT_VECTOR &&
+        args.data[2].GetVectorType() == VectorType::CONSTANT_VECTOR) {
+        
+        auto repo_path_value = ConstantVector::GetData<string_t>(args.data[0]);
+        auto file_path_value = ConstantVector::GetData<string_t>(args.data[1]);
+        auto commit_ref_value = ConstantVector::GetData<string_t>(args.data[2]);
+        
+        if (ConstantVector::IsNull(args.data[0]) || 
+            ConstantVector::IsNull(args.data[1]) ||
+            ConstantVector::IsNull(args.data[2])) {
+            ConstantVector::SetNull(result, true);
+            return;
+        }
+        
+        string repo_path = repo_path_value->GetString();
+        string file_path = file_path_value->GetString();  
+        string commit_ref = commit_ref_value->GetString();
+        
+        // Construct git:// URI: git://<repo_path>/<file_path>@<commit_ref>
+        string uri = "git://" + repo_path;
+        if (!file_path.empty()) {
+            // Add separator if repo_path doesn't end with / and file_path doesn't start with /
+            if (!repo_path.empty() && repo_path.back() != '/' && file_path[0] != '/') {
+                uri += "/";
+            }
+            uri += file_path;
+        }
+        uri += "@" + commit_ref;
+        
+        result.SetVectorType(VectorType::CONSTANT_VECTOR);
+        auto result_data = ConstantVector::GetData<string_t>(result);
+        *result_data = StringVector::AddString(result, uri);
+        return;
+    }
+    
+    // Handle general case with flat vectors
     auto &repo_path_vector = args.data[0];
     auto &file_path_vector = args.data[1]; 
     auto &commit_ref_vector = args.data[2];
