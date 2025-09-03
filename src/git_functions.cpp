@@ -550,9 +550,13 @@ static bool IsCommitRange(const string &param) {
 }
 
 
-// Helper function to construct git:// URI for a file
-static string BuildGitFileUri(const string &repo_path, const string &file_path, const string &commit_hash) {
+// Core function to construct git:// URI from components
+// This is the single source of truth for URI construction logic
+static string ConstructGitUri(const string &repo_path, const string &file_path, const string &revision) {
+    // Start with git:// prefix and repo path
     string uri = "git://" + repo_path;
+    
+    // Add file path if present
     if (!file_path.empty()) {
         // Add separator if repo_path doesn't end with / and file_path doesn't start with /
         if (!repo_path.empty() && repo_path.back() != '/' && file_path[0] != '/') {
@@ -560,8 +564,15 @@ static string BuildGitFileUri(const string &repo_path, const string &file_path, 
         }
         uri += file_path;
     }
-    uri += "@" + commit_hash;
+    
+    // Add revision
+    uri += "@" + revision;
     return uri;
+}
+
+// Helper function to construct git:// URI for a file (wraps ConstructGitUri)
+static string BuildGitFileUri(const string &repo_path, const string &file_path, const string &commit_hash) {
+    return ConstructGitUri(repo_path, file_path, commit_hash);
 }
 
 static void traverse_tree(git_repository *repo, git_tree *tree, const string &base, vector<GitTreeRow> &out, 
@@ -2811,16 +2822,8 @@ static void GitUriFunction(DataChunk &args, ExpressionState &state, Vector &resu
         string file_path = file_path_value->GetString();  
         string commit_ref = commit_ref_value->GetString();
         
-        // Construct git:// URI: git://<repo_path>/<file_path>@<commit_ref>
-        string uri = "git://" + repo_path;
-        if (!file_path.empty()) {
-            // Add separator if repo_path doesn't end with / and file_path doesn't start with /
-            if (!repo_path.empty() && repo_path.back() != '/' && file_path[0] != '/') {
-                uri += "/";
-            }
-            uri += file_path;
-        }
-        uri += "@" + commit_ref;
+        // Use common function to construct URI
+        string uri = ConstructGitUri(repo_path, file_path, commit_ref);
         
         result.SetVectorType(VectorType::CONSTANT_VECTOR);
         auto result_data = ConstantVector::GetData<string_t>(result);
@@ -2859,16 +2862,8 @@ static void GitUriFunction(DataChunk &args, ExpressionState &state, Vector &resu
         string file_path = file_path_data[file_idx].GetString();  
         string commit_ref = commit_ref_data[commit_idx].GetString();
         
-        // Construct git:// URI: git://<repo_path>/<file_path>@<commit_ref>
-        string uri = "git://" + repo_path;
-        if (!file_path.empty()) {
-            // Add separator if repo_path doesn't end with / and file_path doesn't start with /
-            if (!repo_path.empty() && repo_path.back() != '/' && file_path[0] != '/') {
-                uri += "/";
-            }
-            uri += file_path;
-        }
-        uri += "@" + commit_ref;
+        // Use common function to construct URI
+        string uri = ConstructGitUri(repo_path, file_path, commit_ref);
         
         result_data[i] = StringVector::AddString(result, uri);
     }
