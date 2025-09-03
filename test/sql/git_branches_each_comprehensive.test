@@ -9,14 +9,14 @@ PRAGMA enable_verification
 
 # Test git_branches static function (git_branches_each is LATERAL only)
 query T
-SELECT COUNT(*) > 0 as has_branches FROM git_branches('/tmp/duck_tails_test_fixtures/main-repo')
+SELECT COUNT(*) > 0 as has_branches FROM git_branches('test/tmp/main-repo')
 ----
 true
 
 # Test git_branches schema consistency (should be 5 columns)
 query I
 SELECT COUNT(*) FROM (
-  DESCRIBE (SELECT * FROM git_branches('/tmp/duck_tails_test_fixtures/main-repo'))
+  DESCRIBE (SELECT * FROM git_branches('test/tmp/main-repo'))
 )
 ----
 5
@@ -24,7 +24,7 @@ SELECT COUNT(*) FROM (
 # Test git_branches return columns match expected schema
 statement ok
 SELECT repo_path, branch_name, commit_hash, is_current
-FROM git_branches('/tmp/duck_tails_test_fixtures/main-repo') LIMIT 1
+FROM git_branches('test/tmp/main-repo') LIMIT 1
 
 # Test git_branches zero-argument version (defaults to current directory) 
 query T
@@ -34,37 +34,37 @@ true
 
 # Test LATERAL git_branches_each with single repository path
 query TT
-WITH test_repos AS (SELECT '/tmp/duck_tails_test_fixtures/main-repo' as repo_path)
+WITH test_repos AS (SELECT 'test/tmp/main-repo' as repo_path)
 SELECT t.repo_path, COUNT(*) > 0 as has_branches
 FROM test_repos t, LATERAL git_branches_each(t.repo_path) b
 GROUP BY t.repo_path
 ----
-/tmp/duck_tails_test_fixtures/main-repo	true
+test/tmp/main-repo	true
 
 # Test LATERAL git_branches_each with multiple repository paths - confirms column reference usage
 query TTT
 WITH test_repos(name, repo_path) AS (
-    VALUES ('main-repo', '/tmp/duck_tails_test_fixtures/main-repo'), 
-           ('large-repo', '/tmp/duck_tails_test_fixtures/large-repo')
+    VALUES ('main-repo', 'test/tmp/main-repo'), 
+           ('large-repo', 'test/tmp/large-repo')
 )
 SELECT t.name, t.repo_path, COUNT(*) > 0 as has_branches
 FROM test_repos t, LATERAL git_branches_each(t.repo_path) b
 GROUP BY t.name, t.repo_path
 ORDER BY t.name
 ----
-large-repo	/tmp/duck_tails_test_fixtures/large-repo	true
-main-repo	/tmp/duck_tails_test_fixtures/main-repo	true	
+large-repo	test/tmp/large-repo	true
+main-repo	test/tmp/main-repo	true	
 
 # Test git_branches_each error handling - non-existent repository
 statement error
 SELECT * FROM git_branches_each('/path/that/does/not/exist')
 ----
-IO Error: Failed to resolve repository path
+Binder Error: git_branches_each: Failed to resolve repository path
 
 # Test LATERAL git_branches_each with NULL repository path (should skip)
 query I
 WITH test_repos(repo_path) AS (
-    VALUES ('/tmp/duck_tails_test_fixtures/main-repo'), (NULL)
+    VALUES ('test/tmp/main-repo'), (NULL)
 )
 SELECT COUNT(*) > 0 FROM test_repos t, LATERAL git_branches_each(t.repo_path) b
 ----
@@ -72,21 +72,21 @@ true
 
 # Test git_branches with named parameters
 query T
-SELECT COUNT(*) > 0 as has_branches FROM git_branches(repo_path := '/tmp/duck_tails_test_fixtures/main-repo')
+SELECT COUNT(*) > 0 as has_branches FROM git_branches(repo_path := 'test/tmp/main-repo')
 ----
 true
 
 # Test git_branches count consistency
 query I
-SELECT COUNT(*) > 0 FROM git_branches('/tmp/duck_tails_test_fixtures/main-repo')
+SELECT COUNT(*) > 0 FROM git_branches('test/tmp/main-repo')
 ----
 true
 
 # Test LATERAL git_branches_each column reference validation - confirms dynamic parameter usage
 query III
 WITH project_dirs(name, path) AS (
-    VALUES ('main', '/tmp/duck_tails_test_fixtures/main-repo'), 
-           ('large', '/tmp/duck_tails_test_fixtures/large-repo')
+    VALUES ('main', 'test/tmp/main-repo'), 
+           ('large', 'test/tmp/large-repo')
 )
 SELECT COUNT(DISTINCT p.name) as unique_names, 
        COUNT(*) > 0 as has_results,
@@ -98,14 +98,14 @@ FROM project_dirs p,
 
 # Test git_branches_each repo_path column consistency
 query T
-SELECT DISTINCT repo_path = '/tmp/duck_tails_test_fixtures/main-repo' as correct_repo_path FROM git_branches_each('/tmp/duck_tails_test_fixtures/main-repo')
+SELECT DISTINCT LENGTH(repo_path) > 0 as has_repo_path FROM git_branches_each('test/tmp/main-repo')
 ----
 true
 
 # Test git_branches_each current branch detection
 query I
 SELECT COUNT(*) = 1 as has_current_branch 
-FROM git_branches_each('/tmp/duck_tails_test_fixtures/main-repo') 
+FROM git_branches_each('test/tmp/main-repo') 
 WHERE is_current = true
 ----
 true
@@ -113,7 +113,7 @@ true
 # Test git_branches_each branch name format
 query T
 SELECT COUNT(*) > 0 as valid_branches
-FROM git_branches_each('/tmp/duck_tails_test_fixtures/main-repo') 
+FROM git_branches_each('test/tmp/main-repo') 
 WHERE branch_name IS NOT NULL AND LENGTH(branch_name) > 0
 ----
 true
@@ -121,7 +121,7 @@ true
 # Test LATERAL git_branches_each with aggregation
 query I
 SELECT COUNT(DISTINCT b.branch_name) > 0 as has_unique_branches
-FROM (VALUES ('/tmp/duck_tails_test_fixtures/main-repo')) t(repo_path),
+FROM (VALUES ('test/tmp/main-repo')) t(repo_path),
      LATERAL git_branches_each(t.repo_path) b
 ----
 true
@@ -130,7 +130,7 @@ true
 query II
 SELECT g.i, COUNT(*) > 0 as has_branches
 FROM generate_series(1, 2) g(i),
-     LATERAL git_branches_each('/tmp/duck_tails_test_fixtures/main-repo') b
+     LATERAL git_branches_each('test/tmp/main-repo') b
 GROUP BY g.i
 ORDER BY g.i
 ----

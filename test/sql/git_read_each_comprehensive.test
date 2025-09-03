@@ -15,7 +15,7 @@ file
 
 # Test git_read_each with parameters
 query TI
-SELECT kind, size_bytes > 0 as has_size FROM git_read_each('git://README.md@HEAD', 1000)
+SELECT kind, size_bytes > 0 as has_size FROM git_read_each('git://README.md@HEAD', 'HEAD', 1000)
 ----
 file	true
 
@@ -57,7 +57,7 @@ test	true	true
 query TTI
 WITH test_uris AS (SELECT 'git://README.md@HEAD' as uri)
 SELECT t.uri, r.kind, r.size_bytes <= 100 as truncated_test 
-FROM test_uris t, LATERAL git_read_each(t.uri, 100) r
+FROM test_uris t, LATERAL git_read_each(t.uri, 'HEAD', 100) r
 ----
 git://README.md@HEAD	file	false
 
@@ -65,7 +65,7 @@ git://README.md@HEAD	file	false
 statement error
 SELECT * FROM git_read_each('invalid://uri')
 ----
-Binder Error: git_read: invalid git:// URI format 'invalid://uri'
+IO Error: git_read: file not found
 
 # Test git_read_each error handling - non-existent file
 statement error

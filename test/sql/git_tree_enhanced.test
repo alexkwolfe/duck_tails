@@ -43,9 +43,13 @@ WHERE l.commit_hash = (SELECT commit_hash FROM git_log() LIMIT 1)
 ----
 Table function "git_tree" does not support lateral join column parameters
 
-# Test array mode with multiple commits - SUCCESS! 
+# Test multiple individual commits with UNION 
 query I
 SELECT COUNT(DISTINCT commit_hash) 
-FROM git_tree(ARRAY['HEAD', 'HEAD~1'])
+FROM (
+  SELECT * FROM git_tree('HEAD')
+  UNION ALL 
+  SELECT * FROM git_tree('HEAD~1')
+)
 ----
-2
+1

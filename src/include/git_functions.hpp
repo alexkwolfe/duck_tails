@@ -9,10 +9,12 @@ namespace duckdb {
 // Git log table function
 struct GitLogFunctionData : public TableFunctionData {
     explicit GitLogFunctionData(const string &repo_path, const string &resolved_repo_path);
+    explicit GitLogFunctionData(const string &ref);  // For LATERAL functions
     ~GitLogFunctionData();
     
     string repo_path;
     string resolved_repo_path;
+    string ref;  // For LATERAL functions  
     git_repository *repo;
     git_revwalk *walker;
     bool initialized;
@@ -21,6 +23,8 @@ struct GitLogFunctionData : public TableFunctionData {
 void GitLogFunction(ClientContext &context, TableFunctionInput &data_p, DataChunk &output);
 unique_ptr<FunctionData> GitLogBind(ClientContext &context, TableFunctionBindInput &input,
                                    vector<LogicalType> &return_types, vector<string> &names);
+unique_ptr<FunctionData> GitLogEachBind(ClientContext &context, TableFunctionBindInput &input,
+                                       vector<LogicalType> &return_types, vector<string> &names);
 unique_ptr<GlobalTableFunctionState> GitLogInitGlobal(ClientContext &context, TableFunctionInitInput &input);
 
 // Git log row structure for LATERAL processing
@@ -84,6 +88,8 @@ struct GitBranchesFunctionData : public TableFunctionData {
 void GitBranchesFunction(ClientContext &context, TableFunctionInput &data_p, DataChunk &output);
 unique_ptr<FunctionData> GitBranchesBind(ClientContext &context, TableFunctionBindInput &input,
                                         vector<LogicalType> &return_types, vector<string> &names);
+unique_ptr<FunctionData> GitBranchesEachBind(ClientContext &context, TableFunctionBindInput &input,
+                                            vector<LogicalType> &return_types, vector<string> &names);
 unique_ptr<GlobalTableFunctionState> GitBranchesInitGlobal(ClientContext &context, TableFunctionInitInput &input);
 
 // Git tags row structure for LATERAL processing
@@ -124,24 +130,23 @@ struct GitTagsFunctionData : public TableFunctionData {
 void GitTagsFunction(ClientContext &context, TableFunctionInput &data_p, DataChunk &output);
 unique_ptr<FunctionData> GitTagsBind(ClientContext &context, TableFunctionBindInput &input,
                                     vector<LogicalType> &return_types, vector<string> &names);
+unique_ptr<FunctionData> GitTagsEachBind(ClientContext &context, TableFunctionBindInput &input,
+                                        vector<LogicalType> &return_types, vector<string> &names);
 unique_ptr<GlobalTableFunctionState> GitTagsInitGlobal(ClientContext &context, TableFunctionInitInput &input);
 
 // Git tree operation modes
 enum class GitTreeMode {
     SINGLE,    // Single commit (static or dynamic)
-    ARRAY,     // Multiple commits from array
     RANGE      // Commit range (e.g., HEAD~10..HEAD)
 };
 
 // Git tree table function
 struct GitTreeFunctionData : public TableFunctionData {
     explicit GitTreeFunctionData(const string &ref, const string &repo_path);
-    explicit GitTreeFunctionData(const vector<string> &commits, const string &repo_path);
     explicit GitTreeFunctionData(const string &range, const string &repo_path, bool is_range);
     
     GitTreeMode mode;
     string ref;                    // For single commit mode
-    vector<string> commits;        // For array mode
     string commit_range;           // For range mode
     string repo_path;
     vector<struct GitTreeRow> rows;
@@ -159,9 +164,22 @@ struct GitTreeRow {
     string git_file_uri;  // Ready-to-use git:// URI for this file
 };
 
+// Local state for git_tree_each LATERAL processing
+struct GitTreeLocalState : public LocalTableFunctionState {
+    vector<GitTreeRow> current_rows;
+    idx_t current_input_row = 0;
+    idx_t current_output_row = 0;
+    bool initialized_row = false;
+};
+
+// Local init for git_tree_each
+unique_ptr<LocalTableFunctionState> GitTreeLocalInit(ExecutionContext &context, TableFunctionInitInput &input, GlobalTableFunctionState *global_state);
+
 void GitTreeFunction(ClientContext &context, TableFunctionInput &data_p, DataChunk &output);
 unique_ptr<FunctionData> GitTreeBind(ClientContext &context, TableFunctionBindInput &input,
                                     vector<LogicalType> &return_types, vector<string> &names);
+unique_ptr<FunctionData> GitTreeEachBind(ClientContext &context, TableFunctionBindInput &input,
+                                        vector<LogicalType> &return_types, vector<string> &names);
 unique_ptr<GlobalTableFunctionState> GitTreeInitGlobal(ClientContext &context, TableFunctionInitInput &input);
 
 // Git parents table function

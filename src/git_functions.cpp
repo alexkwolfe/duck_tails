@@ -9,6 +9,93 @@
 namespace duckdb {
 
 //===--------------------------------------------------------------------===//
+// Unified Parameter Parsing Helper for New Signature Design
+//===--------------------------------------------------------------------===//
+
+struct UnifiedGitParams {
+    string repo_path_or_uri;
+    string resolved_repo_path;
+    string resolved_file_path;  // For git_read
+    string ref;                 // Optional ref parameter
+    bool has_embedded_ref;      // True if ref came from git:// URI
+    
+    UnifiedGitParams() : repo_path_or_uri("."), resolved_repo_path("."), resolved_file_path(""), ref("HEAD"), has_embedded_ref(false) {}
+};
+
+// Parse parameters using new unified signature: func(repo_path_or_uri, [optional_ref], [other_params...])
+static UnifiedGitParams ParseUnifiedGitParams(TableFunctionBindInput &input, int ref_param_index = 1) {
+    UnifiedGitParams params;
+    
+    // First parameter is always repo_path_or_uri
+    if (!input.inputs.empty()) {
+        auto &first_arg = input.inputs[0];
+        if (first_arg.type().id() == LogicalTypeId::VARCHAR) {
+            params.repo_path_or_uri = first_arg.GetValue<string>();
+        }
+    }
+    
+    // Check if it's a git:// URI with embedded ref
+    if (StringUtil::StartsWith(params.repo_path_or_uri, "git://")) {
+        try {
+            auto git_path = GitPath::Parse(params.repo_path_or_uri);
+            params.resolved_repo_path = git_path.repository_path;
+            params.resolved_file_path = git_path.file_path;
+            params.ref = git_path.revision.empty() ? "HEAD" : git_path.revision;
+            params.has_embedded_ref = !git_path.revision.empty();
+        } catch (const std::exception &e) {
+            throw BinderException("Failed to parse git:// URI '%s': %s", params.repo_path_or_uri, e.what());
+        }
+    } else {
+        // Filesystem path - use repository discovery
+        try {
+            auto git_path = GitPath::Parse("git://" + params.repo_path_or_uri + "@HEAD");
+            params.resolved_repo_path = git_path.repository_path;
+            params.resolved_file_path = git_path.file_path;
+            params.ref = "HEAD";  // Default for filesystem paths
+            params.has_embedded_ref = false;
+        } catch (const std::exception &e) {
+            throw BinderException("Failed to resolve repository path '%s': %s", params.repo_path_or_uri, e.what());
+        }
+    }
+    
+    // Check for optional ref parameter (if not embedded in URI)
+    if (input.inputs.size() > ref_param_index && !input.inputs[ref_param_index].IsNull()) {
+        string explicit_ref = input.inputs[ref_param_index].GetValue<string>();
+        
+        if (params.has_embedded_ref && !explicit_ref.empty()) {
+            throw BinderException("Conflicting ref specifications: git:// URI contains '@%s' but function parameter specifies '%s'", 
+                                params.ref, explicit_ref);
+        }
+        
+        if (!params.has_embedded_ref && !explicit_ref.empty()) {
+            params.ref = explicit_ref;
+        }
+    }
+    
+    return params;
+}
+
+// Parse parameters for LATERAL functions where repo_path comes from runtime DataChunk
+// This function only processes static bind-time parameters (like ref, options)
+static UnifiedGitParams ParseLateralGitParams(TableFunctionBindInput &input, int ref_param_index = 1) {
+    UnifiedGitParams params;
+    
+    // For LATERAL functions, repo_path comes from runtime DataChunk, not bind time
+    // So we only process the optional static parameters here
+    
+    // Check for optional ref parameter
+    if (input.inputs.size() > ref_param_index && !input.inputs[ref_param_index].IsNull()) {
+        string explicit_ref = input.inputs[ref_param_index].GetValue<string>();
+        if (!explicit_ref.empty()) {
+            params.ref = explicit_ref;
+        }
+    }
+    
+    // Note: repo_path_or_uri, resolved_repo_path, resolved_file_path will be set at runtime
+    return params;
+}
+
+//===--------------------------------------------------------------------===//
 // Git Log Function
 //===--------------------------------------------------------------------===//
 
@@ -28,23 +115,8 @@ GitLogFunctionData::~GitLogFunctionData() {
 unique_ptr<FunctionData> GitLogBind(ClientContext &context, TableFunctionBindInput &input,
                                    vector<LogicalType> &return_types, vector<string> &names) {
     
-    // Parse repository path from arguments
-    string repo_path = ".";
-    if (!input.inputs.empty()) {
-        auto &repo_arg = input.inputs[0];
-        if (repo_arg.type().id() == LogicalTypeId::VARCHAR) {
-            repo_path = repo_arg.GetValue<string>();
-        }
-    }
-    
-    // Use GitPath::Parse for repository discovery
-    string resolved_repo_path;
-    try {
-        auto git_path = GitPath::Parse("git://" + repo_path + "@HEAD");
-        resolved_repo_path = git_path.repository_path;
-    } catch (const std::exception &e) {
-        throw IOException("Failed to resolve repository path '%s': %s", repo_path, e.what());
-    }
+    // Use unified parameter parsing to support both git:// URIs and filesystem paths
+    auto params = ParseUnifiedGitParams(input, 1);  // ref parameter at index 1 (optional)
     
     // Define return schema with repo_path as first column
     return_types = {
@@ -66,7 +138,7 @@ unique_ptr<FunctionData> GitLogBind(ClientContext &context, TableFunctionBindInp
         "author_date", "commit_date", "message", "parent_count", "tree_hash"
     };
     
-    return make_uniq<GitLogFunctionData>(repo_path, resolved_repo_path);
+    return make_uniq<GitLogFunctionData>(params.repo_path_or_uri, params.resolved_repo_path);
 }
 
 unique_ptr<GlobalTableFunctionState> GitLogInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
@@ -189,22 +261,8 @@ GitBranchesFunctionData::~GitBranchesFunctionData() {
 unique_ptr<FunctionData> GitBranchesBind(ClientContext &context, TableFunctionBindInput &input,
                                         vector<LogicalType> &return_types, vector<string> &names) {
     
-    string repo_path = ".";
-    if (!input.inputs.empty()) {
-        auto &repo_arg = input.inputs[0];
-        if (repo_arg.type().id() == LogicalTypeId::VARCHAR) {
-            repo_path = repo_arg.GetValue<string>();
-        }
-    }
-    
-    // Use GitPath::Parse for repository discovery
-    string resolved_repo_path;
-    try {
-        auto git_path = GitPath::Parse("git://" + repo_path + "@HEAD");
-        resolved_repo_path = git_path.repository_path;
-    } catch (const std::exception &e) {
-        throw IOException("Failed to resolve repository path '%s': %s", repo_path, e.what());
-    }
+    // Use unified parameter parsing to support both git:// URIs and filesystem paths
+    auto params = ParseUnifiedGitParams(input, 1);  // ref parameter at index 1 (optional)
     
     return_types = {
         LogicalType::VARCHAR,  // repo_path
@@ -216,7 +274,7 @@ unique_ptr<FunctionData> GitBranchesBind(ClientContext &context, TableFunctionBi
     
     names = {"repo_path", "branch_name", "commit_hash", "is_current", "is_remote"};
     
-    return make_uniq<GitBranchesFunctionData>(repo_path, resolved_repo_path);
+    return make_uniq<GitBranchesFunctionData>(params.repo_path_or_uri, params.resolved_repo_path);
 }
 
 unique_ptr<GlobalTableFunctionState> GitBranchesInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
@@ -306,22 +364,8 @@ static int tag_foreach_cb(const char *name, git_oid *oid, void *payload) {
 unique_ptr<FunctionData> GitTagsBind(ClientContext &context, TableFunctionBindInput &input,
                                     vector<LogicalType> &return_types, vector<string> &names) {
     
-    string repo_path = ".";
-    if (!input.inputs.empty()) {
-        auto &repo_arg = input.inputs[0];
-        if (repo_arg.type().id() == LogicalTypeId::VARCHAR) {
-            repo_path = repo_arg.GetValue<string>();
-        }
-    }
-    
-    // Use GitPath::Parse for repository discovery
-    string resolved_repo_path;
-    try {
-        auto git_path = GitPath::Parse("git://" + repo_path + "@HEAD");
-        resolved_repo_path = git_path.repository_path;
-    } catch (const std::exception &e) {
-        throw IOException("Failed to resolve repository path '%s': %s", repo_path, e.what());
-    }
+    // Use unified parameter parsing to support both git:// URIs and filesystem paths
+    auto params = ParseUnifiedGitParams(input, 1);  // ref parameter at index 1 (optional)
     
     return_types = {
         LogicalType::VARCHAR,    // repo_path
@@ -335,7 +379,7 @@ unique_ptr<FunctionData> GitTagsBind(ClientContext &context, TableFunctionBindIn
     
     names = {"repo_path", "tag_name", "commit_hash", "tagger_name", "tagger_date", "message", "is_annotated"};
     
-    return make_uniq<GitTagsFunctionData>(repo_path, resolved_repo_path);
+    return make_uniq<GitTagsFunctionData>(params.repo_path_or_uri, params.resolved_repo_path);
 }
 
 unique_ptr<GlobalTableFunctionState> GitTagsInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
@@ -431,9 +475,6 @@ GitTreeFunctionData::GitTreeFunctionData(const string &ref, const string &repo_p
     : mode(GitTreeMode::SINGLE), ref(ref), repo_path(repo_path), current_index(0), is_dynamic(false) {
 }
 
-GitTreeFunctionData::GitTreeFunctionData(const vector<string> &commits, const string &repo_path)
-    : mode(GitTreeMode::ARRAY), commits(commits), repo_path(repo_path), current_index(0), is_dynamic(false) {
-}
 
 GitTreeFunctionData::GitTreeFunctionData(const string &range, const string &repo_path, bool is_range)
     : mode(GitTreeMode::RANGE), commit_range(range), repo_path(repo_path), current_index(0), is_dynamic(false) {
@@ -453,18 +494,6 @@ static bool IsCommitRange(const string &param) {
            param.find("^") != string::npos;
 }
 
-static vector<string> ParseCommitArray(const Value &array_value) {
-    vector<string> commits;
-    if (array_value.type().id() == LogicalTypeId::LIST) {
-        auto children = ListValue::GetChildren(array_value);
-        for (const auto &child : children) {
-            if (child.type().id() == LogicalTypeId::VARCHAR) {
-                commits.push_back(child.GetValue<string>());
-            }
-        }
-    }
-    return commits;
-}
 
 // Helper function to construct git:// URI for a file
 static string BuildGitFileUri(const string &repo_path, const string &file_path, const string &commit_hash) {
@@ -513,60 +542,50 @@ static void traverse_tree(git_repository *repo, git_tree *tree, const string &ba
 
 unique_ptr<FunctionData> GitTreeBind(ClientContext &context, TableFunctionBindInput &input,
                                     vector<LogicalType> &return_types, vector<string> &names) {
-    string repo_path = ".";
     
-    // Check for named parameter repo_path first
-    if (input.named_parameters.count("repo_path")) {
-        repo_path = StringValue::Get(input.named_parameters.at("repo_path"));
+    // Use unified parameter parsing for new signature: git_tree(repo_path_or_uri, [ref])
+    auto params = ParseUnifiedGitParams(input, 1);  // ref parameter at index 1
+    
+    // Check for named parameter repo_path (backward compatibility)
+    if (input.named_parameters.count("repo_path") && !StringUtil::StartsWith(params.repo_path_or_uri, "git://")) {
+        params.resolved_repo_path = StringValue::Get(input.named_parameters.at("repo_path"));
     }
     
     // Handle different parameter types
     if (input.inputs.empty()) {
-        // Zero arguments - default to HEAD
+        // Zero arguments - default to HEAD in current directory
         names = {"commit_hash", "commit_date", "path", "mode", "blob_hash", "size", "git_file_uri"};
         return_types = {LogicalType::VARCHAR, LogicalType::TIMESTAMP, LogicalType::VARCHAR, 
                        LogicalType::INTEGER, LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::VARCHAR};
-        return make_uniq<GitTreeFunctionData>("HEAD", repo_path);
+        return make_uniq<GitTreeFunctionData>("HEAD", params.resolved_repo_path);
     }
     
     auto &first_param = input.inputs[0];
     
     if (first_param.type().id() == LogicalTypeId::VARCHAR) {
-        string param = first_param.GetValue<string>();
+        // With unified signature, first parameter is repo_path_or_uri, ref comes from second parameter or URI
         
-        // Override repo_path if second parameter provided
-        if (input.inputs.size() >= 2) {
-            repo_path = input.inputs[1].GetValue<string>();
-        }
-        
-        if (IsCommitRange(param)) {
+        if (IsCommitRange(params.ref)) {
             // Range mode: "HEAD~10..HEAD", "--all", etc.
             names = {"commit_hash", "commit_date", "path", "mode", "blob_hash", "size", "git_file_uri"};
             return_types = {LogicalType::VARCHAR, LogicalType::TIMESTAMP, LogicalType::VARCHAR,
                            LogicalType::INTEGER, LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::VARCHAR};
-            return make_uniq<GitTreeFunctionData>(param, repo_path, true);
+            return make_uniq<GitTreeFunctionData>(params.ref, params.resolved_repo_path, true);
         } else {
             // Single commit mode
             names = {"commit_hash", "commit_date", "path", "mode", "blob_hash", "size", "git_file_uri"};
             return_types = {LogicalType::VARCHAR, LogicalType::TIMESTAMP, LogicalType::VARCHAR,
                            LogicalType::INTEGER, LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::VARCHAR};
-            return make_uniq<GitTreeFunctionData>(param, repo_path);
+            return make_uniq<GitTreeFunctionData>(params.ref, params.resolved_repo_path);
         }
     } 
     else if (first_param.type().id() == LogicalTypeId::LIST) {
-        // Array mode: ARRAY['HEAD', 'HEAD~1']
-        auto commits = ParseCommitArray(first_param);
-        if (commits.empty()) {
-            throw InternalException("git_tree: empty commit array provided");
-        }
-        
-        names = {"commit_hash", "commit_date", "path", "mode", "blob_hash", "size", "git_file_uri"};
-        return_types = {LogicalType::VARCHAR, LogicalType::TIMESTAMP, LogicalType::VARCHAR,
-                       LogicalType::INTEGER, LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::VARCHAR};
-        return make_uniq<GitTreeFunctionData>(commits, repo_path);
+        // Array mode: ARRAY['HEAD', 'HEAD~1'] - not supported with new unified signature
+        // This would only be valid for git_tree(LIST) with zero-arg signature 
+        throw InternalException("git_tree: array mode not supported with unified signature. Use git_tree() with named parameter array.");
     }
     
-    throw InternalException("git_tree: unsupported parameter type - expected VARCHAR or LIST");
+    throw InternalException("git_tree: unsupported parameter type - expected VARCHAR");
 }
 
 // Helper function to process a single commit
@@ -614,6 +633,111 @@ static void ProcessSingleCommit(git_repository *repo, const string &ref, const s
     git_object_free(obj);
 }
 
+// Bind function for LATERAL git_tree_each functions  
+unique_ptr<FunctionData> GitTreeEachBind(ClientContext &context, TableFunctionBindInput &input,
+                                        vector<LogicalType> &return_types, vector<string> &names) {
+    
+    // Set default parameters - repo_path_or_uri comes from input DataChunk at runtime
+    string default_ref = "";  // Empty means use current branch, will be resolved at runtime
+    if (input.inputs.size() > 1 && !input.inputs[1].IsNull()) {
+        default_ref = StringValue::Get(input.inputs[1]);
+    }
+    
+    // Define return schema - includes repo_path as first column (like other _each functions)
+    return_types = {
+        LogicalType::VARCHAR,    // repo_path
+        LogicalType::VARCHAR,    // commit_hash
+        LogicalType::TIMESTAMP,  // commit_date
+        LogicalType::VARCHAR,    // path
+        LogicalType::INTEGER,    // mode
+        LogicalType::VARCHAR,    // blob_hash
+        LogicalType::BIGINT,     // size
+        LogicalType::VARCHAR     // git_file_uri
+    };
+    
+    names = {"repo_path", "commit_hash", "commit_date", "path", "mode", "blob_hash", "size", "git_file_uri"};
+    
+    // Create function data with default ref - actual processing happens at runtime
+    return make_uniq<GitTreeFunctionData>(default_ref, ".");  // Use "." as placeholder
+}
+
+// Bind function for LATERAL git_log_each functions - handles static parameters only
+unique_ptr<FunctionData> GitLogEachBind(ClientContext &context, TableFunctionBindInput &input,
+                                       vector<LogicalType> &return_types, vector<string> &names) {
+    
+    // Parse static parameters only (repo_path comes from LATERAL input at runtime)
+    auto params = ParseLateralGitParams(input, 1);  // ref parameter at index 1 (optional)
+    
+    // Define return schema - same as GitLogBind
+    return_types = {
+        LogicalType::VARCHAR,    // repo_path
+        LogicalType::VARCHAR,    // commit_hash
+        LogicalType::VARCHAR,    // author_name  
+        LogicalType::VARCHAR,    // author_email
+        LogicalType::VARCHAR,    // committer_name
+        LogicalType::VARCHAR,    // committer_email
+        LogicalType::TIMESTAMP,  // author_date
+        LogicalType::TIMESTAMP,  // commit_date
+        LogicalType::VARCHAR,    // message
+        LogicalType::INTEGER,    // parent_count
+        LogicalType::VARCHAR     // tree_hash
+    };
+    
+    names = {
+        "repo_path", "commit_hash", "author_name", "author_email", "committer_name", "committer_email",
+        "author_date", "commit_date", "message", "parent_count", "tree_hash"
+    };
+    
+    // Create function data with placeholder values - real repo_path comes at runtime
+    return make_uniq<GitLogFunctionData>(".", params.ref);  // Use "." as placeholder, store ref in resolved_repo_path field
+}
+
+// Bind function for LATERAL git_branches_each functions - handles static parameters only
+unique_ptr<FunctionData> GitBranchesEachBind(ClientContext &context, TableFunctionBindInput &input,
+                                            vector<LogicalType> &return_types, vector<string> &names) {
+    
+    // Parse static parameters only (repo_path comes from LATERAL input at runtime)  
+    auto params = ParseLateralGitParams(input, 1);  // ref parameter at index 1 (optional)
+    
+    // Define return schema - same as GitBranchesBind
+    return_types = {
+        LogicalType::VARCHAR,  // repo_path
+        LogicalType::VARCHAR,  // branch_name
+        LogicalType::VARCHAR,  // commit_hash
+        LogicalType::BOOLEAN,  // is_current
+        LogicalType::BOOLEAN   // is_remote
+    };
+    
+    names = {"repo_path", "branch_name", "commit_hash", "is_current", "is_remote"};
+    
+    // Create function data with placeholder values - real repo_path comes at runtime
+    return make_uniq<GitBranchesFunctionData>(".", ".");  // Use "." as placeholder
+}
+
+// Bind function for LATERAL git_tags_each functions - handles static parameters only
+unique_ptr<FunctionData> GitTagsEachBind(ClientContext &context, TableFunctionBindInput &input,
+                                        vector<LogicalType> &return_types, vector<string> &names) {
+    
+    // Parse static parameters only (repo_path comes from LATERAL input at runtime)
+    auto params = ParseLateralGitParams(input, 1);  // ref parameter at index 1 (optional)
+    
+    // Define return schema - same as GitTagsBind
+    return_types = {
+        LogicalType::VARCHAR,    // repo_path
+        LogicalType::VARCHAR,    // tag_name
+        LogicalType::VARCHAR,    // commit_hash
+        LogicalType::VARCHAR,    // tagger_name
+        LogicalType::TIMESTAMP,  // tagger_date
+        LogicalType::VARCHAR,    // message
+        LogicalType::BOOLEAN     // is_annotated
+    };
+    
+    names = {"repo_path", "tag_name", "commit_hash", "tagger_name", "tagger_date", "message", "is_annotated"};
+    
+    // Create function data with placeholder values - real repo_path comes at runtime
+    return make_uniq<GitTagsFunctionData>(".", ".");  // Use "." as placeholder
+}
+
 unique_ptr<GlobalTableFunctionState> GitTreeInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
     auto &bind_data = const_cast<GitTreeFunctionData&>(input.bind_data->Cast<GitTreeFunctionData>());
     
@@ -635,12 +759,6 @@ unique_ptr<GlobalTableFunctionState> GitTreeInitGlobal(ClientContext &context, T
         switch (bind_data.mode) {
             case GitTreeMode::SINGLE: {
                 ProcessSingleCommit(repo, bind_data.ref, bind_data.repo_path, rows);
-                break;
-            }
-            case GitTreeMode::ARRAY: {
-                for (const auto &commit_ref : bind_data.commits) {
-                    ProcessSingleCommit(repo, commit_ref, bind_data.repo_path, rows);
-                }
                 break;
             }
             case GitTreeMode::RANGE: {
@@ -845,20 +963,14 @@ GitParentsFunctionData::GitParentsFunctionData(const string &ref, const string &
 
 unique_ptr<FunctionData> GitParentsBind(ClientContext &context, TableFunctionBindInput &input,
                                        vector<LogicalType> &return_types, vector<string> &names) {
-    string ref = "HEAD";
-    string repo_path = ".";
     bool all_refs = false;
     
-    if (input.inputs.size() >= 1) {
-        ref = input.inputs[0].GetValue<string>();
-    }
-    if (input.inputs.size() >= 2) {
-        repo_path = input.inputs[1].GetValue<string>();
-    }
+    // Use unified parameter parsing for new signature: git_parents(repo_path_or_uri, [ref])
+    auto params = ParseUnifiedGitParams(input, 1);  // ref parameter at index 1
     
     // Check for named parameters
-    if (input.named_parameters.count("repo_path")) {
-        repo_path = StringValue::Get(input.named_parameters.at("repo_path"));
+    if (input.named_parameters.count("repo_path") && !StringUtil::StartsWith(params.repo_path_or_uri, "git://")) {
+        params.resolved_repo_path = StringValue::Get(input.named_parameters.at("repo_path"));
     }
     if (input.named_parameters.count("all_refs")) {
         all_refs = BooleanValue::Get(input.named_parameters.at("all_refs"));
@@ -867,7 +979,7 @@ unique_ptr<FunctionData> GitParentsBind(ClientContext &context, TableFunctionBin
     names = {"commit_hash", "parent_hash", "parent_index"};
     return_types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::INTEGER};
     
-    return make_uniq<GitParentsFunctionData>(ref, repo_path, all_refs);
+    return make_uniq<GitParentsFunctionData>(params.ref, params.resolved_repo_path, all_refs);
 }
 
 unique_ptr<GlobalTableFunctionState> GitParentsInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
@@ -1071,6 +1183,9 @@ static OperatorResultType GitLogEachFunction(ExecutionContext &context, TableFun
     auto &bind_data = data_p.bind_data->Cast<GitLogFunctionData>();
     auto &state = data_p.local_state->Cast<GitLogLocalState>();
     
+    // Declare resolved_repo_path at function scope so it's accessible in output loop
+    static string resolved_repo_path;
+    
     while (true) {
         if (!state.initialized_row) {
             // initialize for the current input row
@@ -1081,7 +1196,7 @@ static OperatorResultType GitLogEachFunction(ExecutionContext &context, TableFun
                 return OperatorResultType::NEED_MORE_INPUT;
             }
             
-            // LATERAL function: ALWAYS extract commit ref from input DataChunk
+            // LATERAL function: extract repo_path_or_uri from input DataChunk
             input.Flatten();
             
             // Check if input has columns and data
@@ -1097,7 +1212,7 @@ static OperatorResultType GitLogEachFunction(ExecutionContext &context, TableFun
                 continue;
             }
             
-            // Extract commit ref from input DataChunk - direct string_t access
+            // Extract repo_path_or_uri from input DataChunk - direct string_t access
             auto data = FlatVector::GetData<string_t>(input.data[0]);
             if (!data) {
                 throw BinderException("git_log_each: no string data in input column");
@@ -1105,15 +1220,48 @@ static OperatorResultType GitLogEachFunction(ExecutionContext &context, TableFun
             
             // Get the string_t directly and convert to string
             auto string_t_value = data[state.current_input_row];
-            string input_repo_path(string_t_value.GetData(), string_t_value.GetSize());
+            string repo_path_or_uri(string_t_value.GetData(), string_t_value.GetSize());
             
-            if (input_repo_path.empty()) {
-                throw BinderException("git_log_each: received empty repository path from input");
+            if (repo_path_or_uri.empty()) {
+                throw BinderException("git_log_each: received empty repo_path_or_uri from input");
             }
             
-            // Process the git log for this repository using the DRY shared logic
+            // Apply unified parameter processing at runtime
+            // Combine LATERAL input (repo_path) with bind-time parameters (ref stored in resolved_repo_path field)
+            string resolved_file_path, final_ref = bind_data.resolved_repo_path;
+            
+            if (StringUtil::StartsWith(repo_path_or_uri, "git://")) {
+                // git:// URI - parse it
+                try {
+                    auto git_path = GitPath::Parse(repo_path_or_uri);
+                    resolved_repo_path = git_path.repository_path;
+                    resolved_file_path = git_path.file_path;
+                    
+                    // Check for ref conflict validation
+                    if (!git_path.revision.empty() && bind_data.resolved_repo_path != "HEAD") {
+                        throw BinderException("git_log_each: Conflicting ref specifications: git:// URI contains '@%s' but function parameter specifies '%s'", 
+                                            git_path.revision, bind_data.resolved_repo_path);
+                    }
+                    if (!git_path.revision.empty()) {
+                        final_ref = git_path.revision;
+                    }
+                } catch (const std::exception &e) {
+                    throw BinderException("git_log_each: Failed to parse git:// URI '%s': %s", repo_path_or_uri, e.what());
+                }
+            } else {
+                // Filesystem path - use repository discovery
+                try {
+                    auto git_path = GitPath::Parse("git://" + repo_path_or_uri + "@" + final_ref);
+                    resolved_repo_path = git_path.repository_path;
+                    resolved_file_path = git_path.file_path;
+                } catch (const std::exception &e) {
+                    throw BinderException("git_log_each: Failed to resolve repository path '%s': %s", repo_path_or_uri, e.what());
+                }
+            }
+            
+            // Process the git log using the resolved parameters
             state.current_rows.clear();
-            ProcessLogCommitForInOut(input_repo_path, bind_data.repo_path, state.current_rows);
+            ProcessLogCommitForInOut(resolved_repo_path, final_ref, state.current_rows);
             
             state.initialized_row = true;
             state.current_output_row = 0;
@@ -1127,7 +1275,7 @@ static OperatorResultType GitLogEachFunction(ExecutionContext &context, TableFun
             auto &row = state.current_rows[state.current_output_row];
             
             // Fill output row with git log data
-            output.SetValue(0, output_count, Value(row.repo_path));
+            output.SetValue(0, output_count, Value(resolved_repo_path));
             output.SetValue(1, output_count, Value(row.commit_hash));
             output.SetValue(2, output_count, Value(row.author_name));  
             output.SetValue(3, output_count, Value(row.author_email));
@@ -1253,6 +1401,9 @@ static OperatorResultType GitBranchesEachFunction(ExecutionContext &context, Tab
     auto &bind_data = data_p.bind_data->Cast<GitBranchesFunctionData>();
     auto &state = data_p.local_state->Cast<GitBranchesLocalState>();
     
+    // Declare resolved_repo_path at function scope so it's accessible in output loop
+    static string resolved_repo_path;
+    
     while (true) {
         if (!state.initialized_row) {
             if (state.current_input_row >= input.size()) {
@@ -1261,35 +1412,62 @@ static OperatorResultType GitBranchesEachFunction(ExecutionContext &context, Tab
                 return OperatorResultType::NEED_MORE_INPUT;
             }
             
+            // LATERAL function: extract repo_path_or_uri from input DataChunk
             input.Flatten();
             
-            string input_repo_path;
+            // Check if input has columns and data
             if (input.ColumnCount() == 0) {
-                // Zero-argument static call: use bind_data repo_path (defaults to ".")
-                input_repo_path = bind_data.repo_path.empty() ? "." : bind_data.repo_path;
+                throw BinderException("git_branches_each: no input columns available");
+            }
+            
+            // Check if the input is null
+            if (FlatVector::IsNull(input.data[0], state.current_input_row)) {
+                // Move to next input row if null
+                state.current_input_row++;
+                state.initialized_row = false;
+                continue;
+            }
+            
+            // Extract repo_path_or_uri from input DataChunk - direct string_t access
+            auto data = FlatVector::GetData<string_t>(input.data[0]);
+            if (!data) {
+                throw BinderException("git_branches_each: no string data in input column");
+            }
+            
+            // Get the string_t directly and convert to string
+            auto string_t_value = data[state.current_input_row];
+            string repo_path_or_uri(string_t_value.GetData(), string_t_value.GetSize());
+            
+            if (repo_path_or_uri.empty()) {
+                throw BinderException("git_branches_each: received empty repo_path_or_uri from input");
+            }
+            
+            // Apply unified parameter processing at runtime
+            string resolved_file_path;
+            
+            if (StringUtil::StartsWith(repo_path_or_uri, "git://")) {
+                // git:// URI - parse it
+                try {
+                    auto git_path = GitPath::Parse(repo_path_or_uri);
+                    resolved_repo_path = git_path.repository_path;
+                    resolved_file_path = git_path.file_path;
+                } catch (const std::exception &e) {
+                    throw BinderException("git_branches_each: Failed to parse git:// URI '%s': %s", repo_path_or_uri, e.what());
+                }
             } else {
-                // LATERAL call: extract repo_path from input column
-                if (FlatVector::IsNull(input.data[0], state.current_input_row)) {
-                    state.current_input_row++;
-                    state.initialized_row = false;
-                    continue;
-                }
-                
-                auto data = FlatVector::GetData<string_t>(input.data[0]);
-                if (!data) {
-                    throw BinderException("git_branches_each: no string data in input column");
-                }
-                
-                auto string_t_value = data[state.current_input_row];
-                input_repo_path = string(string_t_value.GetData(), string_t_value.GetSize());
-                
-                if (input_repo_path.empty()) {
-                    throw BinderException("git_branches_each: received empty repository path from input");
+                // Filesystem path - use repository discovery
+                try {
+                    auto git_path = GitPath::Parse("git://" + repo_path_or_uri + "@HEAD");
+                    resolved_repo_path = git_path.repository_path;
+                    resolved_file_path = git_path.file_path;
+                } catch (const std::exception &e) {
+                    throw BinderException("git_branches_each: Failed to resolve repository path '%s': %s", repo_path_or_uri, e.what());
                 }
             }
             
+            // Process the git branches using the resolved parameters
             state.current_rows.clear();
-            ProcessBranchesForInOut(input_repo_path, bind_data.repo_path, state.current_rows);
+            ProcessBranchesForInOut(resolved_repo_path, ".", state.current_rows);
             
             state.initialized_row = true;
             state.current_output_row = 0;
@@ -1301,7 +1479,7 @@ static OperatorResultType GitBranchesEachFunction(ExecutionContext &context, Tab
             
             auto &row = state.current_rows[state.current_output_row];
             
-            output.SetValue(0, output_count, Value(row.repo_path));
+            output.SetValue(0, output_count, Value(resolved_repo_path));
             output.SetValue(1, output_count, Value(row.branch_name));
             output.SetValue(2, output_count, Value(row.commit_hash));
             output.SetValue(3, output_count, Value(row.is_current));
@@ -1436,6 +1614,9 @@ static OperatorResultType GitTagsEachFunction(ExecutionContext &context, TableFu
     auto &bind_data = data_p.bind_data->Cast<GitTagsFunctionData>();
     auto &state = data_p.local_state->Cast<GitTagsLocalState>();
     
+    // Declare resolved_repo_path at function scope so it's accessible in output loop
+    static string resolved_repo_path;
+    
     while (true) {
         if (!state.initialized_row) {
             if (state.current_input_row >= input.size()) {
@@ -1444,35 +1625,62 @@ static OperatorResultType GitTagsEachFunction(ExecutionContext &context, TableFu
                 return OperatorResultType::NEED_MORE_INPUT;
             }
             
+            // LATERAL function: extract repo_path_or_uri from input DataChunk
             input.Flatten();
             
-            string input_repo_path;
+            // Check if input has columns and data
             if (input.ColumnCount() == 0) {
-                // Zero-argument static call: use bind_data repo_path (defaults to ".")
-                input_repo_path = bind_data.repo_path.empty() ? "." : bind_data.repo_path;
+                throw BinderException("git_tags_each: no input columns available");
+            }
+            
+            // Check if the input is null
+            if (FlatVector::IsNull(input.data[0], state.current_input_row)) {
+                // Move to next input row if null
+                state.current_input_row++;
+                state.initialized_row = false;
+                continue;
+            }
+            
+            // Extract repo_path_or_uri from input DataChunk - direct string_t access
+            auto data = FlatVector::GetData<string_t>(input.data[0]);
+            if (!data) {
+                throw BinderException("git_tags_each: no string data in input column");
+            }
+            
+            // Get the string_t directly and convert to string
+            auto string_t_value = data[state.current_input_row];
+            string repo_path_or_uri(string_t_value.GetData(), string_t_value.GetSize());
+            
+            if (repo_path_or_uri.empty()) {
+                throw BinderException("git_tags_each: received empty repo_path_or_uri from input");
+            }
+            
+            // Apply unified parameter processing at runtime
+            string resolved_file_path;
+            
+            if (StringUtil::StartsWith(repo_path_or_uri, "git://")) {
+                // git:// URI - parse it
+                try {
+                    auto git_path = GitPath::Parse(repo_path_or_uri);
+                    resolved_repo_path = git_path.repository_path;
+                    resolved_file_path = git_path.file_path;
+                } catch (const std::exception &e) {
+                    throw BinderException("git_tags_each: Failed to parse git:// URI '%s': %s", repo_path_or_uri, e.what());
+                }
             } else {
-                // LATERAL call: extract repo_path from input column
-                if (FlatVector::IsNull(input.data[0], state.current_input_row)) {
-                    state.current_input_row++;
-                    state.initialized_row = false;
-                    continue;
-                }
-                
-                auto data = FlatVector::GetData<string_t>(input.data[0]);
-                if (!data) {
-                    throw BinderException("git_tags_each: no string data in input column");
-                }
-                
-                auto string_t_value = data[state.current_input_row];
-                input_repo_path = string(string_t_value.GetData(), string_t_value.GetSize());
-                
-                if (input_repo_path.empty()) {
-                    throw BinderException("git_tags_each: received empty repository path from input");
+                // Filesystem path - use repository discovery
+                try {
+                    auto git_path = GitPath::Parse("git://" + repo_path_or_uri + "@HEAD");
+                    resolved_repo_path = git_path.repository_path;
+                    resolved_file_path = git_path.file_path;
+                } catch (const std::exception &e) {
+                    throw BinderException("git_tags_each: Failed to resolve repository path '%s': %s", repo_path_or_uri, e.what());
                 }
             }
             
+            // Process the git tags using the resolved parameters
             state.current_rows.clear();
-            ProcessTagsForInOut(input_repo_path, bind_data.repo_path, state.current_rows);
+            ProcessTagsForInOut(resolved_repo_path, ".", state.current_rows);
             
             state.initialized_row = true;
             state.current_output_row = 0;
@@ -1484,7 +1692,7 @@ static OperatorResultType GitTagsEachFunction(ExecutionContext &context, TableFu
             
             auto &row = state.current_rows[state.current_output_row];
             
-            output.SetValue(0, output_count, Value(row.repo_path));
+            output.SetValue(0, output_count, Value(resolved_repo_path));
             output.SetValue(1, output_count, Value(row.tag_name));
             output.SetValue(2, output_count, Value(row.commit_hash));
             output.SetValue(3, output_count, Value(row.tagger_name));
@@ -1522,13 +1730,13 @@ void RegisterGitLogFunction(DatabaseInstance &db) {
     TableFunctionSet git_log_each_set("git_log_each");
     
     // Version that takes commit ref as first parameter (for LATERAL context)
-    TableFunction git_log_each_single({LogicalType::VARCHAR}, nullptr, GitLogBind, nullptr, GitLogLocalInit);
+    TableFunction git_log_each_single({LogicalType::VARCHAR}, nullptr, GitLogEachBind, nullptr, GitLogLocalInit);
     git_log_each_single.in_out_function = GitLogEachFunction;
     git_log_each_single.named_parameters["repo_path"] = LogicalType::VARCHAR;
     git_log_each_set.AddFunction(git_log_each_single);
     
     // Two-argument version (ref, repo_path)
-    TableFunction git_log_each_two({LogicalType::VARCHAR, LogicalType::VARCHAR}, nullptr, GitLogBind, nullptr, GitLogLocalInit);
+    TableFunction git_log_each_two({LogicalType::VARCHAR, LogicalType::VARCHAR}, nullptr, GitLogEachBind, nullptr, GitLogLocalInit);
     git_log_each_two.in_out_function = GitLogEachFunction;
     git_log_each_two.named_parameters["repo_path"] = LogicalType::VARCHAR;
     git_log_each_set.AddFunction(git_log_each_two);
@@ -1550,20 +1758,14 @@ void RegisterGitBranchesFunction(DatabaseInstance &db) {
     // LATERAL git_branches_each function (repository path comes from LATERAL context) - ONLY for dynamic input
     TableFunctionSet git_branches_each_set("git_branches_each");
     
-    // Zero-argument version (defaults to current directory)
-    TableFunction git_branches_each_zero({}, nullptr, GitBranchesBind, nullptr, GitBranchesLocalInit);
-    git_branches_each_zero.in_out_function = GitBranchesEachFunction;
-    git_branches_each_zero.named_parameters["repo_path"] = LogicalType::VARCHAR;
-    git_branches_each_set.AddFunction(git_branches_each_zero);
-    
     // Version that takes repository path as first parameter (for LATERAL context)
-    TableFunction git_branches_each_single({LogicalType::VARCHAR}, nullptr, GitBranchesBind, nullptr, GitBranchesLocalInit);
+    TableFunction git_branches_each_single({LogicalType::VARCHAR}, nullptr, GitBranchesEachBind, nullptr, GitBranchesLocalInit);
     git_branches_each_single.in_out_function = GitBranchesEachFunction;
     git_branches_each_single.named_parameters["repo_path"] = LogicalType::VARCHAR;
     git_branches_each_set.AddFunction(git_branches_each_single);
     
     // Two-argument version (repo_path, repo_path)
-    TableFunction git_branches_each_two({LogicalType::VARCHAR, LogicalType::VARCHAR}, nullptr, GitBranchesBind, nullptr, GitBranchesLocalInit);
+    TableFunction git_branches_each_two({LogicalType::VARCHAR, LogicalType::VARCHAR}, nullptr, GitBranchesEachBind, nullptr, GitBranchesLocalInit);
     git_branches_each_two.in_out_function = GitBranchesEachFunction;
     git_branches_each_two.named_parameters["repo_path"] = LogicalType::VARCHAR;
     git_branches_each_set.AddFunction(git_branches_each_two);
@@ -1585,20 +1787,14 @@ void RegisterGitTagsFunction(DatabaseInstance &db) {
     // LATERAL git_tags_each function (repository path comes from LATERAL context) - ONLY for dynamic input
     TableFunctionSet git_tags_each_set("git_tags_each");
     
-    // Zero-argument version (defaults to current directory)
-    TableFunction git_tags_each_zero({}, nullptr, GitTagsBind, nullptr, GitTagsLocalInit);
-    git_tags_each_zero.in_out_function = GitTagsEachFunction;
-    git_tags_each_zero.named_parameters["repo_path"] = LogicalType::VARCHAR;
-    git_tags_each_set.AddFunction(git_tags_each_zero);
-    
     // Version that takes repository path as first parameter (for LATERAL context)
-    TableFunction git_tags_each_single({LogicalType::VARCHAR}, nullptr, GitTagsBind, nullptr, GitTagsLocalInit);
+    TableFunction git_tags_each_single({LogicalType::VARCHAR}, nullptr, GitTagsEachBind, nullptr, GitTagsLocalInit);
     git_tags_each_single.in_out_function = GitTagsEachFunction;
     git_tags_each_single.named_parameters["repo_path"] = LogicalType::VARCHAR;
     git_tags_each_set.AddFunction(git_tags_each_single);
     
     // Two-argument version (repo_path, repo_path)
-    TableFunction git_tags_each_two({LogicalType::VARCHAR, LogicalType::VARCHAR}, nullptr, GitTagsBind, nullptr, GitTagsLocalInit);
+    TableFunction git_tags_each_two({LogicalType::VARCHAR, LogicalType::VARCHAR}, nullptr, GitTagsEachBind, nullptr, GitTagsLocalInit);
     git_tags_each_two.in_out_function = GitTagsEachFunction;
     git_tags_each_two.named_parameters["repo_path"] = LogicalType::VARCHAR;
     git_tags_each_set.AddFunction(git_tags_each_two);
@@ -1610,17 +1806,9 @@ void RegisterGitTagsFunction(DatabaseInstance &db) {
 // Git Tree Each LATERAL Function (for dynamic parameters)
 //===--------------------------------------------------------------------===//
 
-struct GitTreeLocalState : public LocalTableFunctionState {
-    vector<GitTreeRow> current_rows;
-    idx_t current_output_row = 0;
-    idx_t current_input_row = 0;
-    string repo_path;
-    bool initialized_row = false;
-};
-
-static unique_ptr<LocalTableFunctionState> GitTreeLocalInit(ExecutionContext &context,
-                                                           TableFunctionInitInput &input,
-                                                           GlobalTableFunctionState *global_state) {
+unique_ptr<LocalTableFunctionState> GitTreeLocalInit(ExecutionContext &context,
+                                                     TableFunctionInitInput &input,
+                                                     GlobalTableFunctionState *global_state) {
     return make_uniq<GitTreeLocalState>();
 }
 
@@ -1651,6 +1839,9 @@ static OperatorResultType GitTreeEachFunction(ExecutionContext &context, TableFu
     auto &bind_data = data_p.bind_data->Cast<GitTreeFunctionData>();
     auto &state = data_p.local_state->Cast<GitTreeLocalState>();
     
+    // Declare resolved_repo_path at function scope so it's accessible in output loop
+    static string resolved_repo_path;
+    
     while (true) {
         if (!state.initialized_row) {
             // initialize for the current input row
@@ -1661,7 +1852,7 @@ static OperatorResultType GitTreeEachFunction(ExecutionContext &context, TableFu
                 return OperatorResultType::NEED_MORE_INPUT;
             }
             
-            // LATERAL function: ALWAYS extract commit ref from input DataChunk
+            // LATERAL function: extract repo_path_or_uri from input DataChunk
             input.Flatten();
             
             // Check if input has columns and data
@@ -1677,7 +1868,7 @@ static OperatorResultType GitTreeEachFunction(ExecutionContext &context, TableFu
                 continue;
             }
             
-            // Extract commit ref from input DataChunk - direct string_t access
+            // Extract repo_path_or_uri from input DataChunk - direct string_t access
             auto data = FlatVector::GetData<string_t>(input.data[0]);
             if (!data) {
                 throw BinderException("git_tree_each: no string data in input column");
@@ -1685,15 +1876,62 @@ static OperatorResultType GitTreeEachFunction(ExecutionContext &context, TableFu
             
             // Get the string_t directly and convert to string
             auto string_t_value = data[state.current_input_row];
-            string commit_ref(string_t_value.GetData(), string_t_value.GetSize());
+            string repo_path_or_uri(string_t_value.GetData(), string_t_value.GetSize());
             
-            if (commit_ref.empty()) {
-                throw BinderException("git_tree_each: received empty commit reference from input");
+            if (repo_path_or_uri.empty()) {
+                throw BinderException("git_tree_each: received empty repo_path_or_uri from input");
             }
             
-            // Process the git tree for this commit using the DRY shared logic
+            // Get ref parameter - either from input columns or use default (current branch)
+            string final_ref = bind_data.ref; // Default from bind
+            if (input.ColumnCount() > 1 && !FlatVector::IsNull(input.data[1], state.current_input_row)) {
+                auto ref_data = FlatVector::GetData<string_t>(input.data[1]);
+                if (ref_data) {
+                    auto ref_string_t = ref_data[state.current_input_row];
+                    final_ref = string(ref_string_t.GetData(), ref_string_t.GetSize());
+                }
+            }
+            
+            // If no ref specified, use current branch (empty string will trigger GitPath to use current branch)
+            if (final_ref.empty()) {
+                final_ref = "HEAD";  // GitPath::Parse will resolve HEAD to current branch
+            }
+            
+            // Apply unified parameter processing at runtime
+            string resolved_file_path;
+            
+            if (StringUtil::StartsWith(repo_path_or_uri, "git://")) {
+                // git:// URI - parse it
+                try {
+                    auto git_path = GitPath::Parse(repo_path_or_uri);
+                    resolved_repo_path = git_path.repository_path;
+                    resolved_file_path = git_path.file_path;
+                    
+                    // Check for ref conflict validation
+                    if (!git_path.revision.empty() && final_ref != "HEAD") {
+                        throw BinderException("git_tree_each: Conflicting ref specifications: git:// URI contains '@%s' but function parameter specifies '%s'", 
+                                            git_path.revision, final_ref);
+                    }
+                    if (!git_path.revision.empty()) {
+                        final_ref = git_path.revision;
+                    }
+                } catch (const std::exception &e) {
+                    throw BinderException("git_tree_each: Failed to parse git:// URI '%s': %s", repo_path_or_uri, e.what());
+                }
+            } else {
+                // Filesystem path - use repository discovery
+                try {
+                    auto git_path = GitPath::Parse("git://" + repo_path_or_uri + "@" + final_ref);
+                    resolved_repo_path = git_path.repository_path;
+                    resolved_file_path = git_path.file_path;
+                } catch (const std::exception &e) {
+                    throw BinderException("git_tree_each: Failed to resolve repository path '%s': %s", repo_path_or_uri, e.what());
+                }
+            }
+            
+            // Process the git tree using the resolved parameters
             state.current_rows.clear();
-            ProcessTreeCommitForInOut(commit_ref, bind_data.repo_path, state.current_rows);
+            ProcessTreeCommitForInOut(final_ref, resolved_repo_path, state.current_rows);
             
             state.initialized_row = true;
             state.current_output_row = 0;
@@ -1712,13 +1950,14 @@ static OperatorResultType GitTreeEachFunction(ExecutionContext &context, TableFu
         
         for (idx_t i = 0; i < count; i++) {
             auto &row = state.current_rows[state.current_output_row + i];
-            output.SetValue(0, i, Value(row.commit_hash));           // commit_hash
-            output.SetValue(1, i, Value::TIMESTAMP(row.commit_date)); // commit_date
-            output.SetValue(2, i, Value(row.path));                  // path
-            output.SetValue(3, i, Value::INTEGER(row.mode));         // mode
-            output.SetValue(4, i, Value(row.blob_hash));             // blob_hash
-            output.SetValue(5, i, Value::BIGINT(row.size));          // size
-            output.SetValue(6, i, Value(row.git_file_uri));          // git_file_uri
+            output.SetValue(0, i, Value(resolved_repo_path));       // repo_path
+            output.SetValue(1, i, Value(row.commit_hash));           // commit_hash
+            output.SetValue(2, i, Value::TIMESTAMP(row.commit_date)); // commit_date
+            output.SetValue(3, i, Value(row.path));                  // path
+            output.SetValue(4, i, Value::INTEGER(row.mode));         // mode
+            output.SetValue(5, i, Value(row.blob_hash));             // blob_hash
+            output.SetValue(6, i, Value::BIGINT(row.size));          // size
+            output.SetValue(7, i, Value(row.git_file_uri));          // git_file_uri
         }
         
         output.SetCardinality(count);
@@ -1742,7 +1981,7 @@ void RegisterGitTreeFunction(DatabaseInstance &db) {
     git_tree_single.named_parameters["repo_path"] = LogicalType::VARCHAR;
     git_tree_set.AddFunction(git_tree_single);
     
-    // Two-argument version (ref, repo_path)
+    // Two-argument version (repo_path_or_uri, ref)
     TableFunction git_tree_two({LogicalType::VARCHAR, LogicalType::VARCHAR}, GitTreeFunction, GitTreeBind, GitTreeInitGlobal);
     git_tree_two.named_parameters["repo_path"] = LogicalType::VARCHAR;
     git_tree_set.AddFunction(git_tree_two);
@@ -1762,23 +2001,17 @@ void RegisterGitTreeFunction(DatabaseInstance &db) {
     // LATERAL git_tree_each function (commit ref comes from LATERAL context) - ONLY for dynamic input
     TableFunctionSet git_tree_each_set("git_tree_each");
     
-    // Version that takes commit ref as first parameter (for LATERAL context)
-    TableFunction git_tree_each_single({LogicalType::VARCHAR}, nullptr, GitTreeBind, nullptr, GitTreeLocalInit);
+    // Version that takes repo_path_or_uri as first parameter (for LATERAL context)
+    TableFunction git_tree_each_single({LogicalType::VARCHAR}, nullptr, GitTreeEachBind, nullptr, GitTreeLocalInit);
     git_tree_each_single.in_out_function = GitTreeEachFunction;
     git_tree_each_single.named_parameters["repo_path"] = LogicalType::VARCHAR;
     git_tree_each_set.AddFunction(git_tree_each_single);
     
-    // Two-argument version (ref, repo_path)
-    TableFunction git_tree_each_two({LogicalType::VARCHAR, LogicalType::VARCHAR}, nullptr, GitTreeBind, nullptr, GitTreeLocalInit);
+    // Two-argument version (repo_path_or_uri, ref)
+    TableFunction git_tree_each_two({LogicalType::VARCHAR, LogicalType::VARCHAR}, nullptr, GitTreeEachBind, nullptr, GitTreeLocalInit);
     git_tree_each_two.in_out_function = GitTreeEachFunction;
     git_tree_each_two.named_parameters["repo_path"] = LogicalType::VARCHAR;
     git_tree_each_set.AddFunction(git_tree_each_two);
-    
-    // Array version (multiple commits)
-    TableFunction git_tree_each_array({LogicalType::LIST(LogicalType::VARCHAR)}, nullptr, GitTreeBind, nullptr, GitTreeLocalInit);
-    git_tree_each_array.in_out_function = GitTreeEachFunction;
-    git_tree_each_array.named_parameters["repo_path"] = LogicalType::VARCHAR;
-    git_tree_each_set.AddFunction(git_tree_each_array);
     
     ExtensionUtil::RegisterFunction(db, git_tree_each_set);
 }
@@ -1789,7 +2022,7 @@ void RegisterGitParentsFunction(DatabaseInstance &db) {
     git_parents_func_one.named_parameters["all_refs"] = LogicalType::BOOLEAN;
     ExtensionUtil::RegisterFunction(db, git_parents_func_one);
     
-    // Two-parameter version (ref, repo_path)
+    // Two-parameter version (repo_path_or_uri, ref)
     TableFunction git_parents_func_two("git_parents", {LogicalType::VARCHAR, LogicalType::VARCHAR}, GitParentsFunction, GitParentsBind, GitParentsInitGlobal);
     git_parents_func_two.named_parameters["all_refs"] = LogicalType::BOOLEAN;
     ExtensionUtil::RegisterFunction(db, git_parents_func_two);
@@ -2109,35 +2342,68 @@ static void ProcessGitURI(const string& uri, const GitReadBindData& bind_data,
 static unique_ptr<FunctionData> GitReadBind(ClientContext &context, TableFunctionBindInput &input,
                                           vector<LogicalType> &return_types, vector<string> &names) {
     
-    // Extract URI parameter
+    // Extract first parameter (repo_path_or_uri_with_file)
     if (input.inputs.empty()) {
-        throw BinderException("git_read requires at least one parameter: the URI");
+        throw BinderException("git_read requires at least one parameter: the file path or git:// URI");
     }
     
-    string uri = input.inputs[0].GetValue<string>();
-    
-    // Set default parameters
-    int64_t max_bytes = -1;  // No limit by default
-    string decode_base64 = "auto";
-    string transcode = "utf8";
-    string filters = "raw";
+    string first_param = input.inputs[0].GetValue<string>();
+    string uri;
     string repo_path = ".";
     
-    // Parse optional parameters
-    if (input.inputs.size() >= 2 && !input.inputs[1].IsNull()) {
-        max_bytes = input.inputs[1].GetValue<int64_t>();
-    }
-    if (input.inputs.size() >= 3 && !input.inputs[2].IsNull()) {
-        decode_base64 = input.inputs[2].GetValue<string>();
-    }
-    if (input.inputs.size() >= 4 && !input.inputs[3].IsNull()) {
-        transcode = input.inputs[3].GetValue<string>();
-    }
-    if (input.inputs.size() >= 5 && !input.inputs[4].IsNull()) {
-        filters = input.inputs[4].GetValue<string>();
+    // Check if it's a git:// URI or filesystem path
+    if (StringUtil::StartsWith(first_param, "git://")) {
+        // git:// URI - use as-is (existing behavior)
+        uri = first_param;
+    } else {
+        // Filesystem path - use unified parameter parsing to build git:// URI
+        auto params = ParseUnifiedGitParams(input, 1);  // ref parameter at index 1
+        
+        // Build git:// URI from discovered repo and file paths
+        if (params.resolved_file_path.empty()) {
+            throw BinderException("git_read: filesystem path '%s' does not appear to contain a file component", first_param);
+        }
+        
+        uri = "git://" + params.resolved_repo_path + "/" + params.resolved_file_path + "@" + params.ref;
+        repo_path = params.resolved_repo_path;
     }
     
-    // Check for repo_path named parameter
+    // Set default parameters - note parameter indices shift by 1 if ref was provided
+    int64_t max_bytes = -1;  // No limit by default
+    string decode_base64 = "auto";
+    string transcode = "utf8";  
+    string filters = "raw";
+    
+    // Determine parameter offset based on whether filesystem path had ref parameter
+    int param_offset = 1;
+    if (!StringUtil::StartsWith(first_param, "git://") && input.inputs.size() >= 2 && 
+        input.inputs[1].type().id() == LogicalTypeId::VARCHAR) {
+        // Second parameter might be ref for filesystem paths - check if third param is int (max_bytes)
+        if (input.inputs.size() >= 3 && input.inputs[2].type().id() == LogicalTypeId::BIGINT) {
+            param_offset = 2;  // ref was provided, skip to max_bytes at index 2
+        }
+    }
+    
+    // Parse optional parameters with correct offset
+    if (input.inputs.size() > param_offset && !input.inputs[param_offset].IsNull()) {
+        if (input.inputs[param_offset].type().id() == LogicalTypeId::BIGINT) {
+            max_bytes = input.inputs[param_offset].GetValue<int64_t>();
+            param_offset++;
+        }
+    }
+    if (input.inputs.size() > param_offset && !input.inputs[param_offset].IsNull()) {
+        decode_base64 = input.inputs[param_offset].GetValue<string>();
+        param_offset++;
+    }
+    if (input.inputs.size() > param_offset && !input.inputs[param_offset].IsNull()) {
+        transcode = input.inputs[param_offset].GetValue<string>();
+        param_offset++;
+    }
+    if (input.inputs.size() > param_offset && !input.inputs[param_offset].IsNull()) {
+        filters = input.inputs[param_offset].GetValue<string>();
+    }
+    
+    // Check for repo_path named parameter (backward compatibility)
     for (const auto &kv : input.named_parameters) {
         if (kv.first == "repo_path") {
             repo_path = kv.second.GetValue<string>();
@@ -2211,26 +2477,27 @@ static void GitReadFunction(ClientContext &context, TableFunctionInput &input, D
 static unique_ptr<FunctionData> GitReadEachBind(ClientContext &context, TableFunctionBindInput &input,
                                           vector<LogicalType> &return_types, vector<string> &names) {
     
-    // Set default parameters - URI comes from input DataChunk at runtime
+    // Set default parameters - repo_path_or_uri_with_file comes from input DataChunk at runtime
     int64_t max_bytes = -1;  // No limit by default
     string decode_base64 = "auto";
     string transcode = "utf8";
     string filters = "raw";
     string repo_path = ".";
     
-    // Handle optional parameters (URI is NOT a bind parameter - comes from LATERAL context)
-    // First parameter is URI from LATERAL, so optional params start at index 1
-    if (input.inputs.size() >= 2 && !input.inputs[1].IsNull()) {
-        max_bytes = input.inputs[1].GetValue<int64_t>();
-    }
+    // Handle optional parameters with new unified signature:
+    // repo_path_or_uri_with_file (from LATERAL), [ref], [max_bytes], [decode_base64], [transcode]
+    // The ref parameter is now at index 1, max_bytes at index 2
     if (input.inputs.size() >= 3 && !input.inputs[2].IsNull()) {
-        decode_base64 = input.inputs[2].GetValue<string>();
+        max_bytes = input.inputs[2].GetValue<int64_t>();
     }
     if (input.inputs.size() >= 4 && !input.inputs[3].IsNull()) {
-        transcode = input.inputs[3].GetValue<string>();
+        decode_base64 = input.inputs[3].GetValue<string>();
     }
     if (input.inputs.size() >= 5 && !input.inputs[4].IsNull()) {
-        filters = input.inputs[4].GetValue<string>();
+        transcode = input.inputs[4].GetValue<string>();
+    }
+    if (input.inputs.size() >= 6 && !input.inputs[5].IsNull()) {
+        filters = input.inputs[5].GetValue<string>();
     }
     
     // Check for repo_path named parameter
@@ -2297,7 +2564,7 @@ static OperatorResultType GitReadEachFunction(ExecutionContext &context, TableFu
                 continue;
             }
             
-            // Extract URI from input DataChunk - direct string_t access
+            // Extract repo_path_or_uri from input DataChunk - direct string_t access
             auto data = FlatVector::GetData<string_t>(input.data[0]);
             if (!data) {
                 throw BinderException("git_read_each: no string data in input column");
@@ -2305,10 +2572,63 @@ static OperatorResultType GitReadEachFunction(ExecutionContext &context, TableFu
             
             // Get the string_t directly and convert to string
             auto string_t_value = data[state.current_input_row];
-            string uri(string_t_value.GetData(), string_t_value.GetSize());
+            string first_param(string_t_value.GetData(), string_t_value.GetSize());
             
-            if (uri.empty()) {
-                throw BinderException("git_read_each: received empty URI from input");
+            if (first_param.empty()) {
+                throw BinderException("git_read_each: received empty repo_path_or_uri from input");
+            }
+            
+            // Convert to git:// URI if needed (same logic as GitReadBind)
+            string uri;
+            if (StringUtil::StartsWith(first_param, "git://")) {
+                // Check for ref conflict validation
+                string explicit_ref = "";
+                if (input.ColumnCount() > 1 && !FlatVector::IsNull(input.data[1], state.current_input_row)) {
+                    auto ref_data = FlatVector::GetData<string_t>(input.data[1]);
+                    if (ref_data) {
+                        auto ref_string_t = ref_data[state.current_input_row];
+                        explicit_ref = string(ref_string_t.GetData(), ref_string_t.GetSize());
+                    }
+                }
+                
+                // Check if git:// URI has embedded ref and explicit ref was also provided
+                if (!explicit_ref.empty()) {
+                    try {
+                        auto git_path = GitPath::Parse(first_param);
+                        if (!git_path.revision.empty()) {
+                            throw BinderException("git_read_each: Conflicting ref specifications: git:// URI contains '@%s' but function parameter specifies '%s'", 
+                                                git_path.revision, explicit_ref);
+                        }
+                    } catch (const std::exception &e) {
+                        // If parsing fails, let ProcessGitURI handle the error
+                    }
+                }
+                
+                uri = first_param;  // Use git:// URI as-is
+            } else {
+                // Filesystem path - need to convert to git:// URI
+                // Create a mock input for unified parameter parsing
+                vector<Value> mock_inputs;
+                mock_inputs.push_back(Value(first_param));
+                
+                // Add optional ref parameter if available from input
+                string ref = "HEAD";  // Default ref
+                if (input.ColumnCount() > 1 && !FlatVector::IsNull(input.data[1], state.current_input_row)) {
+                    auto ref_data = FlatVector::GetData<string_t>(input.data[1]);
+                    if (ref_data) {
+                        auto ref_string_t = ref_data[state.current_input_row];
+                        ref = string(ref_string_t.GetData(), ref_string_t.GetSize());
+                    }
+                }
+                
+                try {
+                    // Use GitPath::Parse for repository discovery and path extraction
+                    auto git_path = GitPath::Parse("git://" + first_param + "@" + ref);
+                    uri = "git://" + git_path.repository_path + "/" + git_path.file_path + "@" + ref;
+                } catch (const std::exception &e) {
+                    throw BinderException("git_read_each: failed to resolve filesystem path '%s': %s", 
+                                        first_param.c_str(), e.what());
+                }
             }
             
             // Process the URI and extract content
@@ -2401,20 +2721,39 @@ void RegisterGitReadFunction(DatabaseInstance &db) {
     
     ExtensionUtil::RegisterFunction(db, git_read_set);
     
-    // LATERAL git_read_each function (URI comes from LATERAL context)
+    // LATERAL git_read_each function (first param comes from LATERAL context)
+    // New unified signature: git_read_each(repo_path_or_uri_with_file, [ref], [max_bytes], [other_options...])
     TableFunctionSet git_read_each_set("git_read_each");
     
-    // Version that takes URI as first parameter (for LATERAL context)
+    // Version 1: repo_path_or_uri_with_file only
     TableFunction git_read_each_1({LogicalType::VARCHAR}, nullptr, GitReadEachBind, nullptr, GitReadLocalInit);
     git_read_each_1.in_out_function = GitReadEachFunction;
     git_read_each_1.named_parameters["repo_path"] = LogicalType::VARCHAR;
     git_read_each_set.AddFunction(git_read_each_1);
     
-    // Version with URI and max_bytes parameters
-    TableFunction git_read_each_2({LogicalType::VARCHAR, LogicalType::BIGINT}, nullptr, GitReadEachBind, nullptr, GitReadLocalInit);
+    // Version 2: repo_path_or_uri_with_file, ref
+    TableFunction git_read_each_2({LogicalType::VARCHAR, LogicalType::VARCHAR}, nullptr, GitReadEachBind, nullptr, GitReadLocalInit);
     git_read_each_2.in_out_function = GitReadEachFunction;
     git_read_each_2.named_parameters["repo_path"] = LogicalType::VARCHAR;
     git_read_each_set.AddFunction(git_read_each_2);
+    
+    // Version 3: repo_path_or_uri_with_file, ref, max_bytes
+    TableFunction git_read_each_3({LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BIGINT}, nullptr, GitReadEachBind, nullptr, GitReadLocalInit);
+    git_read_each_3.in_out_function = GitReadEachFunction;
+    git_read_each_3.named_parameters["repo_path"] = LogicalType::VARCHAR;
+    git_read_each_set.AddFunction(git_read_each_3);
+    
+    // Version 4: repo_path_or_uri_with_file, ref, max_bytes, decode_base64
+    TableFunction git_read_each_4({LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::VARCHAR}, nullptr, GitReadEachBind, nullptr, GitReadLocalInit);
+    git_read_each_4.in_out_function = GitReadEachFunction;
+    git_read_each_4.named_parameters["repo_path"] = LogicalType::VARCHAR;
+    git_read_each_set.AddFunction(git_read_each_4);
+    
+    // Version 5: repo_path_or_uri_with_file, ref, max_bytes, decode_base64, transcode
+    TableFunction git_read_each_5({LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::VARCHAR, LogicalType::VARCHAR}, nullptr, GitReadEachBind, nullptr, GitReadLocalInit);
+    git_read_each_5.in_out_function = GitReadEachFunction;
+    git_read_each_5.named_parameters["repo_path"] = LogicalType::VARCHAR;
+    git_read_each_set.AddFunction(git_read_each_5);
     
     ExtensionUtil::RegisterFunction(db, git_read_each_set);
 }

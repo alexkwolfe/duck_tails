@@ -25,7 +25,7 @@ IO Error: git_read: file not found 'non_existent_file.txt' in commit 'HEAD'
 statement error
 SELECT * FROM git_read('invalid://uri')
 ----
-Binder Error: git_read: invalid git:// URI format 'invalid://uri'
+IO Error: git_read: file not found
 
 # Test git_read with max_bytes parameter
 query IT

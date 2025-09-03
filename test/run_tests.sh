@@ -31,21 +31,41 @@ echo "Validating test fixtures..."
 echo "Running DuckDB tests..."
 cd "$PROJECT_DIR"
 
+# Detect which build is available (prefer debug, fallback to release)
+BUILD_TYPE=""
+if [ -f "./build/debug/test/unittest" ]; then
+    BUILD_TYPE="debug"
+    echo "Using debug build for tests..."
+elif [ -f "./build/release/test/unittest" ]; then
+    BUILD_TYPE="release" 
+    echo "Using release build for tests..."
+else
+    echo "Error: No unittest executable found in build/debug or build/release"
+    echo "Please run 'make debug' or 'make release' first"
+    exit 1
+fi
+
+UNITTEST_PATH="./build/$BUILD_TYPE/test/unittest"
+
 # Run individual test files or all tests based on arguments
 if [ $# -eq 0 ]; then
     # Run all tests
     echo "Running all tests..."
-    make test
+    if [ "$BUILD_TYPE" = "debug" ]; then
+        make test_debug_internal
+    else
+        make test_release_internal
+    fi
 else
     # Run specific test files
     for test_file in "$@"; do
         echo "Running test: $test_file"
         if [[ "$test_file" == *".test" ]]; then
             # Run specific .test file
-            ./build/*/test/unittest "[sql]" --test-dir=test/sql --file="$test_file"
+            "$UNITTEST_PATH" "$test_file"
         else
             # Run by pattern
-            ./build/*/test/unittest "$test_file"
+            "$UNITTEST_PATH" "$test_file"
         fi
     done
 fi

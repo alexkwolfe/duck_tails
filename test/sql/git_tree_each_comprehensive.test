@@ -9,62 +9,61 @@ PRAGMA enable_verification
 
 # Test direct git_tree_each calls (basic functionality)
 query T
-SELECT COUNT(*) > 0 as has_files FROM git_tree_each('HEAD')
+SELECT COUNT(*) > 0 as has_files FROM git_tree_each('test/tmp/main-repo', 'HEAD')
 ----
 true
 
-# Test git_tree_each schema consistency (should have 7 columns including git_file_uri)
+# Test git_tree_each schema consistency (should have 8 columns including repo_path and git_file_uri)
 query I
 SELECT COUNT(*) FROM (
-  DESCRIBE (SELECT * FROM git_tree_each('HEAD'))
+  DESCRIBE (SELECT * FROM git_tree_each('test/tmp/main-repo', 'HEAD'))
 )
 ----
-7
+8
 
 # Test git_tree_each return columns match expected schema
 statement ok
 SELECT commit_hash, commit_date, path, mode, blob_hash, size, git_file_uri
-FROM git_tree_each('HEAD') LIMIT 1
+FROM git_tree_each('test/tmp/main-repo', 'HEAD') LIMIT 1
 
-# Test LATERAL git_tree_each with single commit
+# Test LATERAL git_tree_each with single repository path
 query TT  
-WITH test_commits AS (SELECT 'HEAD' as commit_ref)
-SELECT t.commit_ref, COUNT(*) > 0 as has_files FROM test_commits t, LATERAL git_tree_each(t.commit_ref) r
-GROUP BY t.commit_ref
+WITH test_repos AS (SELECT 'test/tmp/main-repo' as repo_path)
+SELECT t.repo_path, COUNT(*) > 0 as has_files FROM test_repos t, LATERAL git_tree_each(t.repo_path, 'HEAD') r
+GROUP BY t.repo_path
 ----
-HEAD	true
+test/tmp/main-repo	true
 
-# Test LATERAL git_tree_each with multiple commits
+# Test LATERAL git_tree_each with multiple repository paths  
 query TT
-WITH test_commits(commit_ref) AS (
-    VALUES ('HEAD'), ('HEAD~1') 
+WITH test_repos(repo_path) AS (
+    VALUES ('test/tmp/main-repo'), ('test/tmp/main-repo') 
 )
-SELECT t.commit_ref, COUNT(*) > 0 as has_files 
-FROM test_commits t, LATERAL git_tree_each(t.commit_ref) r
-GROUP BY t.commit_ref
-ORDER BY t.commit_ref
+SELECT t.repo_path, COUNT(*) > 0 as has_files 
+FROM test_repos t, LATERAL git_tree_each(t.repo_path, 'HEAD') r
+GROUP BY t.repo_path
+ORDER BY t.repo_path
 ----
-HEAD	true
-HEAD~1	true
+test/tmp/main-repo	true
 
 # Test git_tree_each with invalid commit returns no rows  
 query I
-SELECT COUNT(*) FROM git_tree_each('invalid_commit_hash_that_does_not_exist')
+SELECT COUNT(*) FROM git_tree_each('test/tmp/main-repo', 'invalid_commit_hash_that_does_not_exist')
 ----
 0
 
-# Test LATERAL git_tree_each with NULL commit (should skip NULL, process HEAD)
+# Test LATERAL git_tree_each with NULL repo path (should skip NULL)
 query I
-WITH test_commits(commit_ref) AS (
-    VALUES ('HEAD'), (NULL)
+WITH test_repos(repo_path) AS (
+    VALUES ('test/tmp/main-repo'), (NULL)
 )
-SELECT COUNT(*) FROM test_commits t, LATERAL git_tree_each(t.commit_ref) r
+SELECT COUNT(*) FROM test_repos t, LATERAL git_tree_each(t.repo_path, 'HEAD') r
 ----
-52
+3
 
 # Test git_tree_each with named parameters
 query T
-SELECT COUNT(*) > 0 as has_files FROM git_tree_each('HEAD', repo_path := '.')
+SELECT COUNT(*) > 0 as has_files FROM git_tree_each('test/tmp/main-repo')
 ----
 true
 
@@ -74,16 +73,16 @@ SELECT COUNT(*) > 0 as has_files FROM git_tree()
 ----
 true
 
-# Test git_tree array version (git_tree_each array is for LATERAL context)
+# Test git_tree basic version (array mode removed in unified signature)
 query T
-SELECT COUNT(*) > 0 as has_files FROM git_tree(ARRAY['HEAD'])
+SELECT COUNT(*) > 0 as has_files FROM git_tree()
 ----
 true
 
 # Test git_file_uri column format
 query T
-SELECT git_file_uri LIKE 'git://./%@%' as correct_format 
-FROM git_tree_each('HEAD') 
+SELECT git_file_uri LIKE 'git://%/test/tmp/main-repo/README.md@%' as correct_format 
+FROM git_tree_each('test/tmp/main-repo', 'HEAD') 
 WHERE path = 'README.md'
 ----
 true

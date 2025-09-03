@@ -699,6 +699,18 @@ git_tree('git://repo@v1.0.0', 'main')     -- ERROR: conflicting ref specificatio
 git_parents('git://repo@main', 'develop') -- ERROR: conflicting ref specifications
 ```
 
+**Implementation Status**: ✅ **COMPLETED**
+- ✅ **UnifiedGitParams struct**: Created helper struct for parameter parsing (`src/git_functions.cpp:15`)
+- ✅ **ParseUnifiedGitParams function**: Unified parameter parsing with conflict validation (`src/git_functions.cpp:26`)
+- ✅ **git_tree signature change**: `git_tree(repo_path_or_uri, [ref])` implemented (`src/git_functions.cpp:581`)
+- ✅ **git_parents signature change**: `git_parents(repo_path_or_uri, [ref])` implemented (`src/git_functions.cpp:903`)
+- ✅ **git_read filesystem support**: Now accepts both git:// URIs and filesystem paths (`src/git_functions.cpp:2160`)
+- ✅ **git_log/branches/tags enhanced**: Added optional ref parameter support (`src/git_functions.cpp:95,241,344`)
+- ✅ **All _each functions updated**: Match their non-_each counterparts (`src/git_functions.cpp:1576+`)
+- ✅ **Ref conflict validation**: Detects conflicting @ref specifications (`src/git_functions.cpp:65-68`)
+- ✅ **Test updates**: Key test files updated for new signatures (`test/sql/git_tree_parents.test`)
+- ✅ **Backward compatibility**: Existing git:// URI calls still work
+
 **Implementation Requirements**:
 1. **Change git_tree signature**: Move from `(ref, repo_path)` to `(repo_path_or_uri, [ref])`
 2. **Change git_parents signature**: Move from `(ref, repo_path)` to `(repo_path_or_uri, [ref])`  
