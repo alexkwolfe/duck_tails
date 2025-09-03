@@ -73,31 +73,36 @@ GitPath GitPath::Parse(const string &git_url) {
         try {
             result.repository_path = FindGitRepository(url);
             
-            // Normalize the URL path for consistent file path calculation
+            // Normalize both the URL and repository path for consistent comparison
             string normalized_url = NormalizePath(url);
+            string normalized_repo = NormalizePath(result.repository_path);
             
-            // Calculate file path relative to discovered repository using normalized paths
-            if (result.repository_path == "/") {
+            // Calculate file path relative to discovered repository
+            if (normalized_repo == "/") {
+                // Repository is at root - remove leading slash from normalized URL
                 if (normalized_url.length() > 1) {
                     result.file_path = normalized_url.substr(1);
                 } else {
                     result.file_path = "";
                 }
-            } else if (result.repository_path == ".") {
-                // For current directory, use original relative path
-                result.file_path = url;
             } else {
                 // Remove repository path prefix to get relative file path
-                string repo_prefix = result.repository_path;
-                if (!repo_prefix.empty() && repo_prefix.back() != '/') {
-                    repo_prefix += "/";
+                // Ensure repo path ends with / for proper prefix matching
+                if (!normalized_repo.empty() && normalized_repo.back() != '/') {
+                    normalized_repo += "/";
                 }
                 
-                if (normalized_url.length() >= repo_prefix.length() && 
-                    normalized_url.substr(0, repo_prefix.length()) == repo_prefix) {
-                    result.file_path = normalized_url.substr(repo_prefix.length());
+                // Check if the normalized URL starts with the repository path
+                if (normalized_url.length() > normalized_repo.length() && 
+                    normalized_url.substr(0, normalized_repo.length()) == normalized_repo) {
+                    // Extract just the file path part after the repository root
+                    result.file_path = normalized_url.substr(normalized_repo.length());
+                } else if (normalized_url == normalized_repo.substr(0, normalized_repo.length() - 1)) {
+                    // URL exactly matches repository path (without trailing slash)
+                    result.file_path = "";
                 } else {
-                    // Use original relative path if normalized doesn't match
+                    // This shouldn't happen if FindGitRepository worked correctly
+                    // but handle it gracefully - assume the URL is the file path
                     result.file_path = url;
                 }
             }
@@ -205,6 +210,10 @@ unique_ptr<FileHandle> GitFileSystem::OpenFile(const string &path, FileOpenFlags
     
     try {
         auto git_path = GitPath::Parse(path);
+        fprintf(stderr, "OpenReadFile: Parsed git:// path\n");
+        fprintf(stderr, "  Repository: %s\n", git_path.repository_path.c_str());
+        fprintf(stderr, "  File path: %s\n", git_path.file_path.c_str());
+        fprintf(stderr, "  Revision: %s\n", git_path.revision.c_str());
         
         try {
             auto repo = OpenRepository(git_path.repository_path);
@@ -551,34 +560,39 @@ static string GetParentDirectory(const string &path) {
 }
 
 // Finds the git repository root directory by walking up the directory tree from the given path
-// Implements Option 2: walks up from non-existent paths to first existing directory, then searches for .git
+// Uses bottom-up discovery: starts from the deepest path component and walks up to find the nearest .git
 static string FindGitRepository(const string &path) {
-    // Normalize the path (resolves relative paths and .. components)  
-    string current_path = NormalizePath(path);
+    // Start with the original path (may be relative or absolute)
+    string current_path = path;
     
-    // Option 2: Walk up the path until we find something that exists on disk
-    while (!current_path.empty() && current_path != "/" && !PathExists(current_path)) {
+    // If path is relative, convert to absolute for consistent handling
+    if (!current_path.empty() && current_path[0] != '/') {
+        char cwd[PATH_MAX];
+        if (getcwd(cwd, sizeof(cwd)) != nullptr) {
+            current_path = string(cwd) + "/" + current_path;
+        }
+    }
+    
+    // Normalize the path to resolve . and .. components
+    current_path = NormalizePath(current_path);
+    
+    
+    // Start from the full path and walk up looking for a git repository
+    // This ensures we find the deepest (most specific) repository first
+    string original_absolute = current_path;
+    
+    // First, check if the path itself is a file - if so, start from its directory
+    if (PathExists(current_path) && !IsDirectory(current_path)) {
         current_path = GetParentDirectory(current_path);
     }
     
-    // If we couldn't find any existing path, start from current directory
-    if (!PathExists(current_path)) {
-        current_path = ".";
-    }
-    
-    // If path points to a file (not directory), start from its directory
-    if (!IsDirectory(current_path)) {
-        string dir = GetDirectoryFromPath(current_path);
-        if (!dir.empty()) {
-            current_path = dir;
-        }
-    }
-    
-    // Walk up directory tree looking for .git
     while (!current_path.empty() && current_path != "/") {
-        if (IsGitRepository(current_path)) {
+        // Check if this directory contains a .git subdirectory
+        if (PathExists(current_path) && IsDirectory(current_path) && IsGitRepository(current_path)) {
             return current_path;
         }
+        
+        // Move up to parent directory
         current_path = GetParentDirectory(current_path);
     }
     
