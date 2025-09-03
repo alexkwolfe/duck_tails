@@ -19,13 +19,13 @@ SELECT COUNT(*) FROM git_tree() WHERE path LIKE '.%' AND mode > 0 AND length(blo
 ----
 6
 
-# Verify schema has 7 columns as expected
+# Verify schema has 8 columns (including repo_path as first column)
 query I
 SELECT COUNT(*) FROM (
   DESCRIBE (SELECT * FROM git_tree('HEAD'))
 )
 ----
-7
+8
 
 # Test that commit_hash and commit_date are properly populated
 query I

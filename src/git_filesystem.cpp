@@ -210,10 +210,6 @@ unique_ptr<FileHandle> GitFileSystem::OpenFile(const string &path, FileOpenFlags
     
     try {
         auto git_path = GitPath::Parse(path);
-        fprintf(stderr, "OpenReadFile: Parsed git:// path\n");
-        fprintf(stderr, "  Repository: %s\n", git_path.repository_path.c_str());
-        fprintf(stderr, "  File path: %s\n", git_path.file_path.c_str());
-        fprintf(stderr, "  Revision: %s\n", git_path.revision.c_str());
         
         try {
             auto repo = OpenRepository(git_path.repository_path);
@@ -582,8 +578,23 @@ static string FindGitRepository(const string &path) {
     string original_absolute = current_path;
     
     // First, check if the path itself is a file - if so, start from its directory
-    if (PathExists(current_path) && !IsDirectory(current_path)) {
-        current_path = GetParentDirectory(current_path);
+    // Also, if the path contains a file component (has an extension or doesn't exist as directory)
+    // start from its parent directory
+    if (PathExists(current_path)) {
+        if (!IsDirectory(current_path)) {
+            // Path exists and is a file
+            current_path = GetParentDirectory(current_path);
+        }
+    } else {
+        // Path doesn't exist - check if it looks like a file path (has extension or parent exists as directory)
+        size_t last_slash = current_path.rfind('/');
+        if (last_slash != string::npos) {
+            string parent = current_path.substr(0, last_slash);
+            if (PathExists(parent) && IsDirectory(parent)) {
+                // Parent exists as directory, assume current_path is a file path
+                current_path = parent;
+            }
+        }
     }
     
     while (!current_path.empty() && current_path != "/") {

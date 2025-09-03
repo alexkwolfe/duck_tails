@@ -96,6 +96,61 @@ static UnifiedGitParams ParseLateralGitParams(TableFunctionBindInput &input, int
 }
 
 //===--------------------------------------------------------------------===//
+// Helper Functions for Schema Definition and Output
+//===--------------------------------------------------------------------===//
+
+// Schema definition for git_tree (ALWAYS includes repo_path as first column)
+static void DefineGitTreeSchema(vector<LogicalType> &return_types, vector<string> &names) {
+    return_types = {
+        LogicalType::VARCHAR,    // repo_path (ALWAYS first)
+        LogicalType::VARCHAR,    // commit_hash
+        LogicalType::TIMESTAMP,  // commit_date
+        LogicalType::VARCHAR,    // path
+        LogicalType::INTEGER,    // mode
+        LogicalType::VARCHAR,    // blob_hash
+        LogicalType::BIGINT,     // size
+        LogicalType::VARCHAR     // git_file_uri
+    };
+    names = {"repo_path", "commit_hash", "commit_date", "path", "mode", 
+             "blob_hash", "size", "git_file_uri"};
+}
+
+// Schema definition for git_parents (ALWAYS includes repo_path as first column)
+static void DefineGitParentsSchema(vector<LogicalType> &return_types, vector<string> &names) {
+    return_types = {
+        LogicalType::VARCHAR,    // repo_path (ALWAYS first)
+        LogicalType::VARCHAR,    // commit_hash
+        LogicalType::VARCHAR,    // parent_hash
+        LogicalType::INTEGER     // parent_index
+    };
+    names = {"repo_path", "commit_hash", "parent_hash", "parent_index"};
+}
+
+// Output helper for git_tree rows (repo_path is REQUIRED)
+static void OutputGitTreeRow(DataChunk &output, idx_t row_idx, 
+                             const GitTreeRow &row, const string &repo_path) {
+    idx_t col = 0;
+    output.SetValue(col++, row_idx, Value(repo_path));              // repo_path
+    output.SetValue(col++, row_idx, Value(row.commit_hash));        // commit_hash
+    output.SetValue(col++, row_idx, Value::TIMESTAMP(row.commit_date)); // commit_date
+    output.SetValue(col++, row_idx, Value(row.path));               // path
+    output.SetValue(col++, row_idx, Value::INTEGER(row.mode));      // mode
+    output.SetValue(col++, row_idx, Value(row.blob_hash));          // blob_hash
+    output.SetValue(col++, row_idx, Value::BIGINT(row.size));       // size
+    output.SetValue(col++, row_idx, Value(row.git_file_uri));       // git_file_uri
+}
+
+// Output helper for git_parents rows (repo_path is REQUIRED)
+static void OutputGitParentsRow(DataChunk &output, idx_t row_idx,
+                                const GitParentsRow &row, const string &repo_path) {
+    idx_t col = 0;
+    output.SetValue(col++, row_idx, Value(repo_path));              // repo_path
+    output.SetValue(col++, row_idx, Value(row.commit_hash));        // commit_hash
+    output.SetValue(col++, row_idx, Value(row.parent_hash));        // parent_hash
+    output.SetValue(col++, row_idx, Value::INTEGER(row.parent_index)); // parent_index
+}
+
+//===--------------------------------------------------------------------===//
 // Git Log Function
 //===--------------------------------------------------------------------===//
 
@@ -551,12 +606,12 @@ unique_ptr<FunctionData> GitTreeBind(ClientContext &context, TableFunctionBindIn
         params.resolved_repo_path = StringValue::Get(input.named_parameters.at("repo_path"));
     }
     
+    // Use helper to define schema with repo_path as first column
+    DefineGitTreeSchema(return_types, names);
+    
     // Handle different parameter types
     if (input.inputs.empty()) {
         // Zero arguments - default to HEAD in current directory
-        names = {"commit_hash", "commit_date", "path", "mode", "blob_hash", "size", "git_file_uri"};
-        return_types = {LogicalType::VARCHAR, LogicalType::TIMESTAMP, LogicalType::VARCHAR, 
-                       LogicalType::INTEGER, LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::VARCHAR};
         return make_uniq<GitTreeFunctionData>("HEAD", params.resolved_repo_path);
     }
     
@@ -567,15 +622,9 @@ unique_ptr<FunctionData> GitTreeBind(ClientContext &context, TableFunctionBindIn
         
         if (IsCommitRange(params.ref)) {
             // Range mode: "HEAD~10..HEAD", "--all", etc.
-            names = {"commit_hash", "commit_date", "path", "mode", "blob_hash", "size", "git_file_uri"};
-            return_types = {LogicalType::VARCHAR, LogicalType::TIMESTAMP, LogicalType::VARCHAR,
-                           LogicalType::INTEGER, LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::VARCHAR};
             return make_uniq<GitTreeFunctionData>(params.ref, params.resolved_repo_path, true);
         } else {
             // Single commit mode
-            names = {"commit_hash", "commit_date", "path", "mode", "blob_hash", "size", "git_file_uri"};
-            return_types = {LogicalType::VARCHAR, LogicalType::TIMESTAMP, LogicalType::VARCHAR,
-                           LogicalType::INTEGER, LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::VARCHAR};
             return make_uniq<GitTreeFunctionData>(params.ref, params.resolved_repo_path);
         }
     } 
@@ -643,19 +692,8 @@ unique_ptr<FunctionData> GitTreeEachBind(ClientContext &context, TableFunctionBi
         default_ref = StringValue::Get(input.inputs[1]);
     }
     
-    // Define return schema - includes repo_path as first column (like other _each functions)
-    return_types = {
-        LogicalType::VARCHAR,    // repo_path
-        LogicalType::VARCHAR,    // commit_hash
-        LogicalType::TIMESTAMP,  // commit_date
-        LogicalType::VARCHAR,    // path
-        LogicalType::INTEGER,    // mode
-        LogicalType::VARCHAR,    // blob_hash
-        LogicalType::BIGINT,     // size
-        LogicalType::VARCHAR     // git_file_uri
-    };
-    
-    names = {"repo_path", "commit_hash", "commit_date", "path", "mode", "blob_hash", "size", "git_file_uri"};
+    // Use helper to define schema with repo_path as first column
+    DefineGitTreeSchema(return_types, names);
     
     // Create function data with default ref - actual processing happens at runtime
     return make_uniq<GitTreeFunctionData>(default_ref, ".");  // Use "." as placeholder
@@ -811,13 +849,7 @@ void GitTreeFunction(ClientContext &context, TableFunctionInput &data_p, DataChu
     
     for (idx_t i = 0; i < count; i++) {
         auto &row = bind_data.rows[bind_data.current_index + i];
-        output.SetValue(0, i, Value(row.commit_hash));           // commit_hash
-        output.SetValue(1, i, Value::TIMESTAMP(row.commit_date)); // commit_date
-        output.SetValue(2, i, Value(row.path));                  // path
-        output.SetValue(3, i, Value::INTEGER(row.mode));         // mode
-        output.SetValue(4, i, Value(row.blob_hash));             // blob_hash
-        output.SetValue(5, i, Value::BIGINT(row.size));          // size
-        output.SetValue(6, i, Value(row.git_file_uri));          // git_file_uri
+        OutputGitTreeRow(output, i, row, bind_data.repo_path);
     }
 
     output.SetCardinality(count);
@@ -976,8 +1008,8 @@ unique_ptr<FunctionData> GitParentsBind(ClientContext &context, TableFunctionBin
         all_refs = BooleanValue::Get(input.named_parameters.at("all_refs"));
     }
     
-    names = {"commit_hash", "parent_hash", "parent_index"};
-    return_types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::INTEGER};
+    // Use helper to define schema with repo_path as first column
+    DefineGitParentsSchema(return_types, names);
     
     return make_uniq<GitParentsFunctionData>(params.ref, params.resolved_repo_path, all_refs);
 }
@@ -1069,9 +1101,7 @@ void GitParentsFunction(ClientContext &context, TableFunctionInput &data_p, Data
     
     for (idx_t i = 0; i < count; i++) {
         auto &row = bind_data.rows[bind_data.current_index + i];
-        output.SetValue(0, i, Value(row.commit_hash));
-        output.SetValue(1, i, Value(row.parent_hash));
-        output.SetValue(2, i, Value::INTEGER(row.parent_index));
+        OutputGitParentsRow(output, i, row, bind_data.repo_path);
     }
 
     output.SetCardinality(count);
@@ -2184,9 +2214,12 @@ static void ProcessGitURI(const string& uri, const GitReadBindData& bind_data,
     result.text = "";
     result.blob = "";
     
-    string path, commit_hash;
-    if (!ParseGitURI(uri, path, commit_hash)) {
-        throw BinderException("git_read: invalid git:// URI format '%s'", uri);
+    // Use GitPath::Parse for proper repository discovery
+    GitPath git_path;
+    try {
+        git_path = GitPath::Parse(uri);
+    } catch (const IOException &e) {
+        throw BinderException("git_read: %s", e.what());
     }
     
     git_repository *repo = nullptr;
@@ -2196,23 +2229,23 @@ static void ProcessGitURI(const string& uri, const GitReadBindData& bind_data,
     git_blob *blob = nullptr;
     
     try {
-        // Open repository
-        int error = git_repository_open(&repo, bind_data.repo_path.c_str());
+        // Open repository using the discovered repository path
+        int error = git_repository_open(&repo, git_path.repository_path.c_str());
         if (error != 0) {
             const git_error *e = git_error_last();
             throw IOException("git_read: failed to open git repository '%s': %s", 
-                            bind_data.repo_path, e ? e->message : "Unknown error");
+                            git_path.repository_path.c_str(), e ? e->message : "Unknown error");
         }
         
         // Resolve commit (handle both SHA hashes and references like HEAD)
         git_oid commit_oid;
         git_object *obj = nullptr;
-        error = git_revparse_single(&obj, repo, commit_hash.c_str());
+        error = git_revparse_single(&obj, repo, git_path.revision.c_str());
         if (error != 0) {
             const git_error *e = git_error_last();
             git_repository_free(repo); repo = nullptr;
             throw IOException("git_read: failed to resolve commit reference '%s': %s", 
-                            commit_hash, e ? e->message : "Unknown error");
+                            git_path.revision.c_str(), e ? e->message : "Unknown error");
         }
         
         const git_oid *oid = git_object_id(obj);
@@ -2224,7 +2257,7 @@ static void ProcessGitURI(const string& uri, const GitReadBindData& bind_data,
             const git_error *e = git_error_last();
             git_repository_free(repo); repo = nullptr;
             throw IOException("git_read: commit not found '%s': %s", 
-                            commit_hash, e ? e->message : "Unknown error");
+                            git_path.revision.c_str(), e ? e->message : "Unknown error");
         }
         
         // Get tree from commit
@@ -2238,12 +2271,12 @@ static void ProcessGitURI(const string& uri, const GitReadBindData& bind_data,
         }
         
         // Find the file in the tree
-        error = git_tree_entry_bypath(&entry, tree, path.c_str());
+        error = git_tree_entry_bypath(&entry, tree, git_path.file_path.c_str());
         if (error != 0) {
             git_tree_free(tree); tree = nullptr;
             git_commit_free(commit); commit = nullptr;
             git_repository_free(repo); repo = nullptr;
-            throw IOException("git_read: file not found '%s' in commit '%s'", path, commit_hash);
+            throw IOException("git_read: file not found '%s' in commit '%s'", git_path.file_path.c_str(), git_path.revision.c_str());
         }
         
         // Get file mode and kind
@@ -2621,14 +2654,9 @@ static OperatorResultType GitReadEachFunction(ExecutionContext &context, TableFu
                     }
                 }
                 
-                try {
-                    // Use GitPath::Parse for repository discovery and path extraction
-                    auto git_path = GitPath::Parse("git://" + first_param + "@" + ref);
-                    uri = "git://" + git_path.repository_path + "/" + git_path.file_path + "@" + ref;
-                } catch (const std::exception &e) {
-                    throw BinderException("git_read_each: failed to resolve filesystem path '%s': %s", 
-                                        first_param.c_str(), e.what());
-                }
+                // Simply pass the path as a git:// URI and let ProcessGitURI handle it
+                // ProcessGitURI will call GitPath::Parse which does proper repository discovery
+                uri = "git://" + first_param + "@" + ref;
             }
             
             // Process the URI and extract content
