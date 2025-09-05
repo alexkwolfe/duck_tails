@@ -73,11 +73,11 @@ FROM current, previous;
 -- Analyze changes over time
 SELECT 
     c.commit_hash,
-    c.author_date,
+    c.commit_time,
     (SELECT COUNT(*) FROM read_csv('git://metrics.csv@' || c.commit_hash)) as metric_count
-FROM git_log() c
-WHERE c.author_date > '2024-01-01'
-ORDER BY c.author_date;
+FROM git_log('.') c
+WHERE c.commit_time > '2024-01-01'
+ORDER BY c.commit_time;
 ```
 
 ### 🧠 Text Diff Analysis
@@ -175,9 +175,9 @@ SELECT
     repo_path,
     author_name,
     COUNT(*) as commit_count,
-    MIN(author_date) as first_commit,
-    MAX(author_date) as latest_commit
-FROM git_log()
+    MIN(commit_time) as first_commit,
+    MAX(commit_time) as latest_commit
+FROM git_log('.')
 GROUP BY repo_path, author_name
 ORDER BY commit_count DESC;
 
@@ -220,17 +220,23 @@ FROM read_git_diff('git://src/main.py@HEAD~1', 'git://src/main.py@HEAD');
 -- Track configuration changes over time
 SELECT 
     g.commit_hash,
-    g.author_date,
+    g.commit_time,
     g.message,
     r.diff_text
-FROM git_log() g
+FROM git_log('.') g
 CROSS JOIN read_git_diff('git://config.json@' || g.commit_hash || '~1', 
                         'git://config.json@' || g.commit_hash) r
 WHERE length(r.diff_text) > 0  -- Only commits that changed config
 LIMIT 10;
 ```
 
-More complex examples are available in [docs/advanced-examples.md](docs/advanced-examples.md).
+## 📚 Documentation
+
+- **[Function Reference](docs/llmtxt.md)** - Complete reference for all Duck Tails functions
+- **[Database Schema](docs/db.md)** - Detailed table structures and column descriptions  
+- **[Data Flow](docs/ingestion.md)** - How data flows from Git to SQL results
+- **[Advanced Examples](docs/advanced-examples.md)** - Complex query patterns and use cases
+- **[Git URIs](docs/git-uris.md)** - Understanding the git:// protocol syntax
 
 ## 🏗️ Architecture
 
@@ -247,13 +253,13 @@ Duck Tails implements a custom DuckDB FileSystem that intercepts `git://` URLs a
 ### Key Technical Features
 - **Flexible Repository Paths**: Support for relative (`../other-repo`), absolute (`/path/to/repo`), and current directory access
 - **Smart Repository Discovery**: Automatic git repository detection using libgit2 with proper error handling
-- **Repository Context**: All git functions include `repo_path` column showing which repository each result comes from
+- **Repository Context**: All git functions include `repo_path` column showing the absolute repository path
 - **Memory Efficient**: Files loaded on-demand into memory for fast access
 - **Seek Support**: Full random access within git blob content
 - **RAII Design**: Smart pointer usage throughout for memory safety
 - **Error Resilient**: Clear error messages ("No git repository found") with comprehensive edge case handling
 - **Mixed File Systems**: Support for local + git://, S3 + git://, and other combinations
-- **Zero-Argument Functions**: Clean syntax defaulting to current directory
+- **Consistent Arguments**: All functions take repository path as first argument
 - **Comprehensive Test Coverage**: Full test suite ensuring functionality
 
 ## 🛣️ Roadmap
@@ -311,7 +317,8 @@ All new features should include comprehensive tests. Our test suite is designed 
 
 ### 📊 Technical Details
 - **6 core components**: GitFileSystem, GitFileHandle, GitPath, Table Functions, TextDiff, File Integration
-- **17 functions implemented**: git_log, git_branches, git_tags, git_read (multiple arg variants), git_tree, git_parents (multiple arg variants), diff_text, text_diff, read_git_diff (1 and 2 arg), text_diff_lines, text_diff_stats
+- **6 table functions**: git_log, git_branches, git_tags, git_tree, git_read, git_parents (plus _each variants)
+- **3 diff functions**: diff_text, text_diff, read_git_diff with multiple output formats
 - **Repository path discovery**: Automatic git repository detection with relative/absolute path support
 - **libgit2 integration** via vcpkg dependency management
 
