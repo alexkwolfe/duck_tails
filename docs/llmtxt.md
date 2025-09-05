@@ -62,19 +62,30 @@ SELECT * FROM git_tree('.', 'main');
 
 LATERAL join variant of git_tree for use with column values.
 
-Signature:
+Signatures:
 ```sql
-git_tree_each(repo_path VARCHAR, ref VARCHAR) → TABLE
+git_tree_each(ref VARCHAR) → TABLE
+git_tree_each(ref VARCHAR, repo_path VARCHAR) → TABLE
 ```
 
-Returns: Same as git_tree
+Parameters:
+- ref: Git reference or git:// URI
+- repo_path: Repository path (optional)
+
+**URI Support**: Accepts git:// URIs for full composability.
+
+Returns: Same as git_tree, including git_file_uri for each file
 
 Example:
 ```sql
+-- Count files across multiple branches
 WITH refs AS (SELECT 'HEAD' as r UNION SELECT 'main')
 SELECT r, COUNT(*) as file_count
 FROM refs, LATERAL git_tree_each(r) t
 GROUP BY r;
+
+-- Use with git:// URIs
+SELECT * FROM git_tree_each('git:///repo@HEAD');
 ```
 
 ### git_log
@@ -276,39 +287,64 @@ Returns parent commits for a given commit.
 
 Signatures:
 ```sql
-git_parents(commit_hash VARCHAR, repo_path VARCHAR DEFAULT '.') → TABLE
+git_parents(repo_path VARCHAR, ref VARCHAR DEFAULT 'HEAD', all_refs BOOLEAN DEFAULT FALSE) → TABLE
 ```
 
 Returns:
-- parent_number INTEGER: Parent index (1-based)
-- parent_hash VARCHAR: Parent commit hash
-- commit_time TIMESTAMP: Parent commit timestamp
-- commit_message VARCHAR: Parent commit message
-- commit_author VARCHAR: Parent commit author
+- commit_hash VARCHAR: Hash of the commit
+- parent_hash VARCHAR: Hash of the parent commit
+- parent_index INTEGER: Index of the parent (0-based)
 
 Examples:
 ```sql
 -- Get parents of HEAD
-SELECT * FROM git_parents('HEAD');
+SELECT * FROM git_parents('.', 'HEAD');
+
+-- Get parents of all commits
+SELECT * FROM git_parents('.', 'HEAD', true);
 
 -- Find merge commits (commits with multiple parents)
 SELECT commit_hash, COUNT(*) as parent_count
-FROM git_log('.') l
-LEFT JOIN LATERAL git_parents(l.commit_hash) p ON TRUE
+FROM git_parents('.', 'HEAD', true)
 GROUP BY commit_hash
 HAVING COUNT(*) > 1;
 ```
 
 ### git_parents_each
 
-LATERAL join variant of git_parents.
+LATERAL join variant of git_parents. Accepts column references to generate parent rows for multiple commits.
 
-Signature:
+Signatures:
 ```sql
-git_parents_each(commit_hash VARCHAR, repo_path VARCHAR DEFAULT '.') → TABLE
+git_parents_each(ref VARCHAR) → TABLE
+git_parents_each(ref VARCHAR, repo_path VARCHAR) → TABLE
 ```
 
+Parameters:
+- ref: Commit reference (hash, branch, tag) or git:// URI
+- repo_path: Repository path (optional, defaults to current directory)
+
 Returns: Same as git_parents
+
+**URI Support**: All parameters accept git:// URIs for composability with other functions.
+
+Examples:
+```sql
+-- Get parents for multiple commits
+WITH commits AS (
+  SELECT commit_hash FROM git_log('.') LIMIT 10
+)
+SELECT c.commit_hash, p.parent_hash, p.parent_index
+FROM commits c, LATERAL git_parents_each(c.commit_hash, '.') p;
+
+-- Use with git:// URIs from other functions
+WITH commits AS (
+  SELECT 'git://' || '/repo' || '@' || commit_hash as git_uri
+  FROM git_log('/repo')
+)
+SELECT * FROM commits c
+CROSS JOIN LATERAL git_parents_each(c.git_uri) p;
+```
 
 ### git_uri
 
@@ -328,6 +364,40 @@ SELECT git_uri('/path/to/repo', 'src/main.cpp', 'HEAD');
 ```
 
 ## Common Patterns
+
+### URI Composability with LATERAL Joins
+
+All `_each` functions support git:// URIs, enabling powerful composability:
+
+```sql
+-- Chain git_tree → git_log_each to get history for each file
+SELECT 
+  t.path, 
+  COUNT(l.commit_hash) as commits
+FROM git_tree('HEAD', repo_path => '/repo') t
+CROSS JOIN LATERAL git_log_each(t.git_file_uri) l
+GROUP BY t.path;
+
+-- Chain multiple functions using URIs
+WITH tree_files AS (
+  SELECT path, git_file_uri 
+  FROM git_tree('HEAD', repo_path => '/repo')
+),
+file_commits AS (
+  SELECT 
+    tf.path,
+    'git://' || '/repo' || '@' || l.commit_hash as commit_uri,
+    l.commit_hash
+  FROM tree_files tf
+  CROSS JOIN LATERAL git_log_each(tf.git_file_uri) l
+)
+SELECT 
+  fc.path,
+  fc.commit_hash,
+  p.parent_hash
+FROM file_commits fc
+CROSS JOIN LATERAL git_parents_each(fc.commit_uri) p;
+```
 
 ### File History
 
@@ -445,11 +515,100 @@ SELECT * FROM dataset, LATERAL read_parquet(dataset.git_file_uri);
 - File content is loaded into memory, be careful with large files
 - Use LIMIT clauses when exploring unfamiliar repositories
 
+### git_clone
+
+Clones Git repositories from remote URLs with smart conflict handling and automatic path extraction.
+
+Signature:
+```sql
+git_clone(url VARCHAR) → TABLE
+git_clone(url VARCHAR, local_path VARCHAR) → TABLE
+git_clone(url VARCHAR, options STRUCT) → TABLE
+git_clone(url VARCHAR, local_path VARCHAR, options STRUCT) → TABLE
+```
+
+Returns:
+- url VARCHAR: The source repository URL
+- local_path VARCHAR: The actual path where repository was cloned
+- status VARCHAR: 'success' or 'error'
+- action VARCHAR: 'cloned', 'updated', 'up_to_date', or 'error'
+- message VARCHAR: Success message or error details
+- commit_hash VARCHAR: HEAD commit hash of cloned/updated repository
+- previous_hash VARCHAR: Previous HEAD commit (for updates, NULL for clones)
+- commit_time TIMESTAMP: HEAD commit timestamp
+- size_bytes BIGINT: Total repository size (-1 if not available)
+
+Options STRUCT fields (all optional):
+- branch VARCHAR: Specific branch to clone (default: default branch)
+- depth INTEGER: Shallow clone depth (default: NULL = full clone)
+- bare BOOLEAN: Create bare repository (default: false)
+- no_checkout BOOLEAN: Skip checkout after clone (default: false)
+- timeout INTEGER: Timeout in seconds (default: 300 = 5 minutes)
+- force BOOLEAN: Overwrite existing directory (default: false)
+
+Smart Behavior:
+- **Auto-path extraction**: When local_path is omitted, automatically extracts repository name from URL
+- **Smart updates**: If repository already exists, performs `git pull` instead of erroring
+- **Conflict resolution**: Returns 'updated', 'up_to_date', or 'error' for existing repositories
+
+Examples:
+```sql
+-- Basic clone with auto-generated local path
+SELECT * FROM git_clone('https://github.com/duckdb/duckdb.git');
+
+-- Clone to specific directory
+SELECT * FROM git_clone('https://github.com/duckdb/duckdb.git', 'my-duckdb');
+
+-- Shallow clone with options
+SELECT * FROM git_clone('https://github.com/duckdb/duckdb.git', {
+    branch: 'main',
+    depth: 1,
+    timeout: 600
+});
+
+-- Clone multiple repositories (LATERAL join)
+SELECT r.name, c.status, c.local_path
+FROM repo_list r, LATERAL git_clone_each(r.url) c
+WHERE c.status = 'success';
+```
+
+### git_clone_each
+
+LATERAL version of git_clone for processing multiple URLs from input rows.
+
+Signature:
+```sql
+git_clone_each(url VARCHAR) → TABLE
+git_clone_each(url VARCHAR, local_path VARCHAR) → TABLE
+git_clone_each(url VARCHAR, options STRUCT) → TABLE
+git_clone_each(url VARCHAR, local_path VARCHAR, options STRUCT) → TABLE
+```
+
+Returns the same schema as git_clone.
+
+Examples:
+```sql
+-- Create table with repository URLs
+CREATE TABLE repositories AS VALUES
+  ('https://github.com/duckdb/duckdb.git'),
+  ('https://github.com/apache/arrow.git'),
+  ('https://github.com/postgres/postgres.git')
+AS t(url);
+
+-- Clone all repositories
+SELECT r.url, c.status, c.local_path, c.action
+FROM repositories r, LATERAL git_clone_each(r.url) c;
+
+-- Clone with custom paths
+SELECT r.url, c.status, c.local_path
+FROM repositories r, LATERAL git_clone_each(r.url, 'repos/' || RIGHT(r.url, 20)) c;
+```
+
 ## Limitations
 
-- Requires local git repository (no remote repository support)
-- No support for git submodules
-- Cannot modify repository (read-only)
+- Git clone requires network connectivity for remote repositories
+- SSH authentication not yet supported (HTTPS only)
+- No support for git submodules in cloned repositories
 - Binary file content returned as BLOB, text extraction depends on encoding
 - Maximum file size limited by available memory
 

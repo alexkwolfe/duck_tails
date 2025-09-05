@@ -2057,6 +2057,241 @@ void RegisterGitTreeFunction(DatabaseInstance &db) {
     ExtensionUtil::RegisterFunction(db, git_tree_each_set);
 }
 
+// Helper function for processing parents of a single commit
+static void ProcessParentsForCommit(const string &repo_path, const string &commit_ref, vector<GitParentsRow> &rows) {
+    git_libgit2_init();
+    
+    git_repository *repo = nullptr;
+    int error = git_repository_open(&repo, repo_path.c_str());
+    if (error != 0) {
+        const git_error *e = git_error_last();
+        git_libgit2_shutdown();
+        throw IOException("git_parents_each: failed to open repository '%s': %s", 
+                        repo_path, e ? e->message : "Unknown error");
+    }
+    
+    // Resolve the commit
+    git_object *obj = nullptr;
+    if (git_revparse_single(&obj, repo, commit_ref.c_str()) != 0) {
+        const git_error *e = git_error_last();
+        git_repository_free(repo);
+        git_libgit2_shutdown();
+        throw IOException("git_parents_each: cannot resolve ref '%s' in repository '%s': %s", 
+                        commit_ref, repo_path, e ? e->message : "Unknown error");
+    }
+    
+    git_commit *commit = nullptr;
+    if (git_object_type(obj) != GIT_OBJECT_COMMIT) {
+        git_object_free(obj);
+        git_repository_free(repo);
+        git_libgit2_shutdown();
+        throw IOException("git_parents_each: '%s' does not refer to a commit", commit_ref);
+    }
+    
+    if (git_commit_lookup(&commit, repo, git_object_id(obj)) != 0) {
+        git_object_free(obj);
+        git_repository_free(repo);
+        git_libgit2_shutdown();
+        throw IOException("git_parents_each: failed to lookup commit");
+    }
+    
+    // Get commit hash
+    char commit_oid_str[GIT_OID_HEXSZ + 1];
+    git_oid_tostr(commit_oid_str, sizeof(commit_oid_str), git_commit_id(commit));
+    string commit_hash(commit_oid_str);
+    
+    // Process parents
+    unsigned int parent_count = git_commit_parentcount(commit);
+    for (unsigned int i = 0; i < parent_count; i++) {
+        const git_oid *parent_oid = git_commit_parent_id(commit, i);
+        
+        GitParentsRow row;
+        row.commit_hash = commit_hash;
+        
+        char oid_str[GIT_OID_HEXSZ + 1];
+        git_oid_tostr(oid_str, sizeof(oid_str), parent_oid);
+        row.parent_hash = string(oid_str);
+        row.parent_index = i + 1;
+        
+        rows.push_back(row);
+    }
+    
+    git_commit_free(commit);
+    git_object_free(obj);
+    git_repository_free(repo);
+    git_libgit2_shutdown();
+}
+
+// Bind function for git_parents_each
+unique_ptr<FunctionData> GitParentsEachBind(ClientContext &context, TableFunctionBindInput &input,
+                                           vector<LogicalType> &return_types, vector<string> &names) {
+    auto bind_data = make_uniq<GitParentsEachBindData>();
+    
+    // Handle optional second parameter (repo_path)
+    if (input.inputs.size() >= 2) {
+        bind_data->repo_path = StringValue::Get(input.inputs[1]);
+    } else {
+        bind_data->repo_path = ".";  // Default to current directory
+    }
+    
+    // Resolve repository path
+    try {
+        auto git_path = GitPath::Parse("git://" + bind_data->repo_path + "@HEAD");
+        bind_data->repo_path = git_path.repository_path;
+    } catch (const std::exception &e) {
+        throw BinderException("git_parents_each: Failed to resolve repository path '%s': %s", 
+                            bind_data->repo_path, e.what());
+    }
+    
+    // Define schema
+    DefineGitParentsSchema(return_types, names);
+    
+    return bind_data;
+}
+
+// Local init for git_parents_each
+unique_ptr<LocalTableFunctionState> GitParentsLocalInit(ExecutionContext &context, TableFunctionInitInput &input, 
+                                                       GlobalTableFunctionState *global_state) {
+    return make_uniq<GitParentsLocalState>();
+}
+
+// LATERAL git_parents_each function
+OperatorResultType GitParentsEachFunction(ExecutionContext &context, TableFunctionInput &data_p, 
+                                         DataChunk &input, DataChunk &output) {
+    auto &bind_data = data_p.bind_data->Cast<GitParentsEachBindData>();
+    auto &state = data_p.local_state->Cast<GitParentsLocalState>();
+    
+    while (true) {
+        if (!state.initialized_row) {
+            // Initialize for the current input row
+            if (state.current_input_row >= input.size()) {
+                // Ran out of rows
+                state.current_input_row = 0;
+                state.initialized_row = false;
+                return OperatorResultType::NEED_MORE_INPUT;
+            }
+            
+            // LATERAL function: extract commit_hash from input DataChunk
+            input.Flatten();
+            
+            // Check if input has columns and data
+            if (input.ColumnCount() == 0) {
+                throw BinderException("git_parents_each: no input columns available");
+            }
+            
+            // Check if the input is null
+            if (FlatVector::IsNull(input.data[0], state.current_input_row)) {
+                // Move to next input row if null
+                state.current_input_row++;
+                state.initialized_row = false;
+                continue;
+            }
+            
+            // Extract commit_hash from input DataChunk
+            auto data = FlatVector::GetData<string_t>(input.data[0]);
+            if (!data) {
+                throw BinderException("git_parents_each: no string data in input column");
+            }
+            
+            // Get the string_t directly and convert to string
+            auto string_t_value = data[state.current_input_row];
+            string commit_ref_or_uri(string_t_value.GetData(), string_t_value.GetSize());
+            
+            if (commit_ref_or_uri.empty()) {
+                throw BinderException("git_parents_each: received empty commit reference from input");
+            }
+            
+            // Parse the input - could be a git:// URI or just a commit ref
+            string repo_path_to_use = bind_data.repo_path;
+            string commit_ref = commit_ref_or_uri;
+            
+            if (StringUtil::StartsWith(commit_ref_or_uri, "git://")) {
+                // git:// URI - parse it to extract repo_path and ref
+                try {
+                    auto git_path = GitPath::Parse(commit_ref_or_uri);
+                    repo_path_to_use = git_path.repository_path;
+                    
+                    // Use the ref from the URI if present, otherwise default to HEAD
+                    if (!git_path.revision.empty()) {
+                        commit_ref = git_path.revision;
+                    } else {
+                        commit_ref = "HEAD";
+                    }
+                    
+                    // Check if there's a repo_path override from the second parameter
+                    if (input.ColumnCount() > 1 && !FlatVector::IsNull(input.data[1], state.current_input_row)) {
+                        auto repo_data = FlatVector::GetData<string_t>(input.data[1]);
+                        if (repo_data) {
+                            auto repo_string_t = repo_data[state.current_input_row];
+                            string explicit_repo_path(repo_string_t.GetData(), repo_string_t.GetSize());
+                            if (!explicit_repo_path.empty()) {
+                                // Resolve the explicit repo path
+                                try {
+                                    auto explicit_git_path = GitPath::Parse("git://" + explicit_repo_path + "@HEAD");
+                                    repo_path_to_use = explicit_git_path.repository_path;
+                                } catch (const std::exception &e) {
+                                    // Keep using the URI-derived repo path
+                                }
+                            }
+                        }
+                    }
+                } catch (const std::exception &e) {
+                    throw BinderException("git_parents_each: Failed to parse git:// URI '%s': %s", commit_ref_or_uri, e.what());
+                }
+            }
+            
+            // Process the parents for this commit
+            state.current_rows.clear();
+            state.current_repo_path = repo_path_to_use;  // Store the resolved repo path
+            try {
+                ProcessParentsForCommit(repo_path_to_use, commit_ref, state.current_rows);
+            } catch (const std::exception &e) {
+                // If there's an error processing this commit, skip to the next one
+                state.current_input_row++;
+                state.initialized_row = false;
+                continue;
+            }
+            
+            state.initialized_row = true;
+            state.current_output_row = 0;
+        }
+        
+        // Output rows for current input
+        idx_t output_count = 0;
+        while (output_count < STANDARD_VECTOR_SIZE && 
+               state.current_output_row < state.current_rows.size()) {
+            
+            auto &row = state.current_rows[state.current_output_row];
+            
+            // Fill output row with parent data
+            OutputGitParentsRow(output, output_count, row, state.current_repo_path);
+            
+            output_count++;
+            state.current_output_row++;
+        }
+        
+        // Set output cardinality
+        output.SetCardinality(output_count);
+        
+        // Check if we've output all rows for current input
+        if (state.current_output_row >= state.current_rows.size()) {
+            // Move to next input row
+            state.current_input_row++;
+            state.initialized_row = false;
+            
+            // If we produced some output, return it
+            if (output_count > 0) {
+                return OperatorResultType::HAVE_MORE_OUTPUT;
+            }
+            // Otherwise continue with next input
+            continue;
+        }
+        
+        // We have more rows to output for current input
+        return OperatorResultType::HAVE_MORE_OUTPUT;
+    }
+}
+
 void RegisterGitParentsFunction(DatabaseInstance &db) {
     // Single-argument version (ref only, for current directory)
     TableFunction git_parents_func_one("git_parents", {LogicalType::VARCHAR}, GitParentsFunction, GitParentsBind, GitParentsInitGlobal);
@@ -2077,6 +2312,22 @@ void RegisterGitParentsFunction(DatabaseInstance &db) {
     TableFunction git_parents_func_zero("git_parents", {}, GitParentsFunction, GitParentsBind, GitParentsInitGlobal);
     git_parents_func_zero.named_parameters["all_refs"] = LogicalType::BOOLEAN;
     ExtensionUtil::RegisterFunction(db, git_parents_func_zero);
+    
+    // Register git_parents_each variants for LATERAL joins
+    TableFunctionSet git_parents_each_set("git_parents_each");
+    
+    // One-parameter version (commits from LATERAL)
+    TableFunction git_parents_each_single({LogicalType::VARCHAR}, nullptr, GitParentsEachBind, nullptr, GitParentsLocalInit);
+    git_parents_each_single.in_out_function = GitParentsEachFunction;
+    git_parents_each_single.named_parameters["repo_path"] = LogicalType::VARCHAR;
+    git_parents_each_set.AddFunction(git_parents_each_single);
+    
+    // Two-parameter version (commits from LATERAL, repo_path as second parameter)
+    TableFunction git_parents_each_two({LogicalType::VARCHAR, LogicalType::VARCHAR}, nullptr, GitParentsEachBind, nullptr, GitParentsLocalInit);
+    git_parents_each_two.in_out_function = GitParentsEachFunction;
+    git_parents_each_set.AddFunction(git_parents_each_two);
+    
+    ExtensionUtil::RegisterFunction(db, git_parents_each_set);
 }
 
 //===--------------------------------------------------------------------===//
@@ -2877,6 +3128,57 @@ static void RegisterGitUriFunction(DatabaseInstance &db) {
     ExtensionUtil::RegisterFunction(db, git_uri_func);
 }
 
+void RegisterGitCloneFunction(DatabaseInstance &db) {
+    // git_clone(url) -> TABLE
+    TableFunction git_clone_1("git_clone", {LogicalType::VARCHAR}, GitCloneFunction, GitCloneBind, GitCloneInitGlobal);
+    git_clone_1.named_parameters["repo_path"] = LogicalType::VARCHAR;
+    ExtensionUtil::RegisterFunction(db, git_clone_1);
+    
+    // git_clone(url, local_path) -> TABLE  
+    TableFunction git_clone_2("git_clone", {LogicalType::VARCHAR, LogicalType::VARCHAR}, GitCloneFunction, GitCloneBind, GitCloneInitGlobal);
+    git_clone_2.named_parameters["repo_path"] = LogicalType::VARCHAR;
+    ExtensionUtil::RegisterFunction(db, git_clone_2);
+    
+    // git_clone(url, options) -> TABLE
+    TableFunction git_clone_3("git_clone", {LogicalType::VARCHAR, LogicalType::STRUCT({})}, GitCloneFunction, GitCloneBind, GitCloneInitGlobal);
+    git_clone_3.named_parameters["repo_path"] = LogicalType::VARCHAR;
+    ExtensionUtil::RegisterFunction(db, git_clone_3);
+    
+    // git_clone(url, local_path, options) -> TABLE
+    TableFunction git_clone_4("git_clone", {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::STRUCT({})}, GitCloneFunction, GitCloneBind, GitCloneInitGlobal);
+    git_clone_4.named_parameters["repo_path"] = LogicalType::VARCHAR;
+    ExtensionUtil::RegisterFunction(db, git_clone_4);
+    
+    // LATERAL git_clone_each functions (URL comes from LATERAL context)
+    TableFunctionSet git_clone_each_set("git_clone_each");
+    
+    // Version that takes URL as first parameter (for LATERAL context)
+    TableFunction git_clone_each_single({LogicalType::VARCHAR}, nullptr, GitCloneEachBind, nullptr, GitCloneLocalInit);
+    git_clone_each_single.in_out_function = GitCloneEachFunction;
+    git_clone_each_single.named_parameters["repo_path"] = LogicalType::VARCHAR;
+    git_clone_each_set.AddFunction(git_clone_each_single);
+    
+    // Two-argument version (url, local_path)
+    TableFunction git_clone_each_two({LogicalType::VARCHAR, LogicalType::VARCHAR}, nullptr, GitCloneEachBind, nullptr, GitCloneLocalInit);
+    git_clone_each_two.in_out_function = GitCloneEachFunction;
+    git_clone_each_two.named_parameters["repo_path"] = LogicalType::VARCHAR;
+    git_clone_each_set.AddFunction(git_clone_each_two);
+    
+    // With options struct (url, options)
+    TableFunction git_clone_each_opts({LogicalType::VARCHAR, LogicalType::STRUCT({})}, nullptr, GitCloneEachBind, nullptr, GitCloneLocalInit);
+    git_clone_each_opts.in_out_function = GitCloneEachFunction;
+    git_clone_each_opts.named_parameters["repo_path"] = LogicalType::VARCHAR;
+    git_clone_each_set.AddFunction(git_clone_each_opts);
+    
+    // Full version (url, local_path, options)
+    TableFunction git_clone_each_full({LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::STRUCT({})}, nullptr, GitCloneEachBind, nullptr, GitCloneLocalInit);
+    git_clone_each_full.in_out_function = GitCloneEachFunction;
+    git_clone_each_full.named_parameters["repo_path"] = LogicalType::VARCHAR;
+    git_clone_each_set.AddFunction(git_clone_each_full);
+    
+    ExtensionUtil::RegisterFunction(db, git_clone_each_set);
+}
+
 void RegisterGitFunctions(DatabaseInstance &db) {
     RegisterGitLogFunction(db);
     RegisterGitBranchesFunction(db);
@@ -2885,6 +3187,7 @@ void RegisterGitFunctions(DatabaseInstance &db) {
     RegisterGitParentsFunction(db);
     RegisterGitReadFunction(db);
     RegisterGitUriFunction(db);
+    RegisterGitCloneFunction(db);
 }
 
 } // namespace duckdb

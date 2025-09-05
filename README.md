@@ -4,6 +4,13 @@ A DuckDB extension that brings git-aware data analysis capabilities to your data
 
 ## ✨ Features
 
+### 📥 Repository Cloning
+- **git_clone()**: Clone remote repositories with smart conflict handling
+- **Auto-path extraction**: Automatically extracts repository name from URL
+- **Smart updates**: Existing repositories get updated instead of erroring
+- **LATERAL support**: Clone multiple repositories efficiently 
+- **Rich options**: Branch selection, shallow cloning, timeouts
+
 ### 🗂️ Git Filesystem
 Access any file in your git repository at any commit, branch, or tag using the `git://` protocol with flexible repository path support:
 
@@ -43,7 +50,7 @@ FROM git_tags();
 
 -- Explore repository structure
 SELECT commit_hash, commit_date, path, mode, blob_hash, size FROM git_tree('HEAD');
-SELECT commit_hash, parent_hash, parent_index FROM git_parents('HEAD');
+SELECT commit_hash, parent_hash, parent_index FROM git_parents('.', 'HEAD');
 
 -- Query different repositories
 SELECT * FROM git_log('../other-project');
@@ -59,6 +66,43 @@ FROM (
 ) 
 GROUP BY repo_path;
 ```
+
+### 🔄 Repository Cloning
+Clone and manage remote repositories directly from SQL with smart conflict handling:
+
+```sql
+-- Basic clone with auto-generated local path
+SELECT * FROM git_clone('https://github.com/duckdb/duckdb.git');
+
+-- Clone to specific directory  
+SELECT * FROM git_clone('https://github.com/apache/arrow.git', 'my-arrow');
+
+-- Shallow clone with options
+SELECT * FROM git_clone('https://github.com/postgres/postgres.git', {
+    branch: 'main',
+    depth: 1,
+    timeout: 600
+});
+
+-- Clone multiple repositories in one query
+CREATE TABLE repos AS VALUES 
+  ('https://github.com/duckdb/duckdb.git'),
+  ('https://github.com/apache/arrow.git')
+AS t(url);
+
+SELECT r.url, c.status, c.local_path, c.action
+FROM repos r, LATERAL git_clone_each(r.url) c;
+
+-- Smart updates: automatically pulls existing repositories
+SELECT * FROM git_clone('https://github.com/existing/repo.git');
+-- Returns action='updated' if repo exists, 'cloned' if new
+```
+
+**Smart Features:**
+- 🎯 **Auto-path extraction**: Automatically extracts repository name when `local_path` is omitted
+- 🔄 **Smart updates**: Existing repositories are updated via `git pull` instead of erroring
+- ⚡ **LATERAL support**: Process multiple URLs efficiently with `git_clone_each`
+- 🛠️ **Full options**: Branch selection, shallow cloning, timeouts, and more
 
 ### 🔄 Version-Aware Analysis
 Perform sophisticated version comparisons and historical analysis:
@@ -246,6 +290,7 @@ Duck Tails implements a custom DuckDB FileSystem that intercepts `git://` URLs a
 - **GitFileHandle**: Memory-backed file handles for git blob content with seek operations
 - **GitPath**: Parser for git://path@revision syntax supporting branches, tags, and commit hashes
 - **Git Table Functions**: Direct repository metadata access with full commit history
+- **Repository Cloning**: Remote repository cloning with smart conflict resolution
 - **TextDiff Engine**: Advanced line-by-line diff computation with multiple output formats
 - **Real File Integration**: Seamless access to local files, git:// files, and mixed scenarios
 - **vcpkg Integration**: Robust dependency management for cross-platform libgit2 builds
@@ -307,7 +352,7 @@ All new features should include comprehensive tests. Our test suite is designed 
 - **Git Filesystem**: `git://` protocol implementation with revision support
 - **Repository Path Support**: Flexible relative (`../repo`), absolute (`/path/to/repo`), and current directory access
 - **Smart Repository Discovery**: Automatic git repository detection using libgit2 with clear error messages
-- **Table Functions**: Repository metadata access (`git_log`, `git_branches`, `git_tags`, `git_tree`, `git_parents`, `git_read`) with repository context
+- **Table Functions**: Repository metadata access (`git_log`, `git_branches`, `git_tags`, `git_tree`, `git_parents`, `git_read`, `git_clone`) with repository context
 - **Repository Structure**: File tree exploration and commit genealogy analysis
 - **Text Diff Engine**: Diff computation with multiple output formats
 - **File Integration**: Support for local files, git:// files, and mixed scenarios
@@ -316,8 +361,8 @@ All new features should include comprehensive tests. Our test suite is designed 
 - **Comprehensive Test Coverage**: Full test suite with extensive assertions
 
 ### 📊 Technical Details
-- **6 core components**: GitFileSystem, GitFileHandle, GitPath, Table Functions, TextDiff, File Integration
-- **6 table functions**: git_log, git_branches, git_tags, git_tree, git_read, git_parents (plus _each variants)
+- **7 core components**: GitFileSystem, GitFileHandle, GitPath, Table Functions, Repository Cloning, TextDiff, File Integration
+- **7 table functions**: git_log, git_branches, git_tags, git_tree, git_read, git_parents, git_clone (plus _each variants)
 - **3 diff functions**: diff_text, text_diff, read_git_diff with multiple output formats
 - **Repository path discovery**: Automatic git repository detection with relative/absolute path support
 - **libgit2 integration** via vcpkg dependency management

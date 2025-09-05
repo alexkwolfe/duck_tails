@@ -149,7 +149,7 @@ Duck Tails provides virtual tables that expose Git repository data through SQL. 
 
 ### 6. git_parents Table
 
-**Purpose:** Returns parent commits for a given commit.
+**Purpose:** Returns parent commits for commits in a repository.
 
 **Source:** Git commit parent references via libgit2.
 
@@ -157,17 +157,18 @@ Duck Tails provides virtual tables that expose Git repository data through SQL. 
 
 | Column | Type | Description | Source |
 |--------|------|-------------|--------|
-| `parent_number` | INTEGER | Parent index (1-based) | Parent array position + 1 |
-| `parent_hash` | VARCHAR | Parent commit SHA-1 | Git parent OID |
-| `commit_time` | TIMESTAMP | Parent commit timestamp | Parent commit timestamp |
-| `commit_message` | VARCHAR | Parent commit message | Parent commit message |
-| `commit_author` | VARCHAR | Parent commit author | Parent commit author signature |
+| `commit_hash` | VARCHAR | Hash of the commit | Git commit OID |
+| `parent_hash` | VARCHAR | Hash of the parent commit | Git parent OID |
+| `parent_index` | INTEGER | Parent index (0-based) | Parent array position |
 
 **Data Flow:**
-1. Resolve input commit hash to commit object
-2. Iterate through parent OIDs
-3. For each parent, load commit object
-4. Extract commit metadata
+1. Resolve input ref to commit range or single commit
+2. For each commit, iterate through parent OIDs
+3. Return parent relationships
+
+**Variants:**
+- `git_parents(repo_path, ref, all_refs)` - Static function for querying parents
+- `git_parents_each(repo_path, ref)` - LATERAL join variant for column references
 
 ## Table Relationships
 
@@ -177,7 +178,7 @@ Duck Tails provides virtual tables that expose Git repository data through SQL. 
 - `git_branches`: (`repo_path`, `branch_name`)
 - `git_tags`: (`repo_path`, `tag_name`)
 - `git_read`: (`repo_path`, `revision`, `path`)
-- `git_parents`: (`commit_hash`, `parent_number`)
+- `git_parents`: (`commit_hash`, `parent_hash`, `parent_index`)
 
 ### Foreign Key Relationships
 

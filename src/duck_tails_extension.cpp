@@ -24,7 +24,7 @@ static void LoadInternal(DatabaseInstance &instance) {
 	// Register git filesystem
 	RegisterGitFileSystem(instance);
 	
-	// Register git table functions
+	// Register git table functions (now includes git_clone)
 	RegisterGitFunctions(instance);
 	
 	// Register TextDiff type and functions

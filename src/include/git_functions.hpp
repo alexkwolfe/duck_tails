@@ -203,9 +203,45 @@ struct GitParentsRow {
 };
 
 void GitParentsFunction(ClientContext &context, TableFunctionInput &data_p, DataChunk &output);
+
+// Local state for git_parents_each
+struct GitParentsLocalState : public LocalTableFunctionState {
+    vector<GitParentsRow> current_rows;
+    idx_t current_input_row = 0;
+    idx_t current_output_row = 0;
+    bool initialized_row = false;
+    string current_repo_path;  // Store the repo path for the current row being processed
+};
+
+// Bind data for git_parents_each (simpler than regular git_parents)
+struct GitParentsEachBindData : public TableFunctionData {
+    string repo_path;  // Bind-time repository path
+};
+
+// Function declarations for git_parents_each
+unique_ptr<FunctionData> GitParentsEachBind(ClientContext &context, TableFunctionBindInput &input,
+                                           vector<LogicalType> &return_types, vector<string> &names);
+unique_ptr<LocalTableFunctionState> GitParentsLocalInit(ExecutionContext &context, TableFunctionInitInput &input, 
+                                                       GlobalTableFunctionState *global_state);
+OperatorResultType GitParentsEachFunction(ExecutionContext &context, TableFunctionInput &data_p, 
+                                         DataChunk &input, DataChunk &output);
 unique_ptr<FunctionData> GitParentsBind(ClientContext &context, TableFunctionBindInput &input,
                                        vector<LogicalType> &return_types, vector<string> &names);
 unique_ptr<GlobalTableFunctionState> GitParentsInitGlobal(ClientContext &context, TableFunctionInitInput &input);
+
+// Forward declarations from git_clone.hpp
+struct GitCloneFunctionData;
+struct GitCloneLocalState;
+void GitCloneFunction(ClientContext &context, TableFunctionInput &data_p, DataChunk &output);
+OperatorResultType GitCloneEachFunction(ExecutionContext &context, TableFunctionInput &data_p, 
+                                       DataChunk &input, DataChunk &output);
+unique_ptr<FunctionData> GitCloneBind(ClientContext &context, TableFunctionBindInput &input,
+                                     vector<LogicalType> &return_types, vector<string> &names);
+unique_ptr<FunctionData> GitCloneEachBind(ClientContext &context, TableFunctionBindInput &input,
+                                         vector<LogicalType> &return_types, vector<string> &names);
+unique_ptr<GlobalTableFunctionState> GitCloneInitGlobal(ClientContext &context, TableFunctionInitInput &input);
+unique_ptr<LocalTableFunctionState> GitCloneLocalInit(ExecutionContext &context, TableFunctionInitInput &input, 
+                                                     GlobalTableFunctionState *global_state);
 
 // Registration functions
 void RegisterGitLogFunction(DatabaseInstance &db);
@@ -213,6 +249,7 @@ void RegisterGitBranchesFunction(DatabaseInstance &db);
 void RegisterGitTagsFunction(DatabaseInstance &db);
 void RegisterGitTreeFunction(DatabaseInstance &db);
 void RegisterGitParentsFunction(DatabaseInstance &db);
+void RegisterGitCloneFunction(DatabaseInstance &db);
 void RegisterGitFunctions(DatabaseInstance &db);
 
 } // namespace duckdb
