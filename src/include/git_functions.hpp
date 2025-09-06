@@ -162,6 +162,9 @@ struct GitTreeRow {
     string blob_hash;
     int64_t size;
     string git_file_uri;  // Ready-to-use git:// URI for this file
+    string file_path;     // Extracted file path from git_file_uri
+    string file_ext;      // File extension (e.g., .js, .cpp, .md)
+    string ref;          // Extracted ref from git_file_uri
 };
 
 // Local state for git_tree_each LATERAL processing

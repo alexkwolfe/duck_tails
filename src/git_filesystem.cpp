@@ -183,8 +183,7 @@ void GitFileHandle::Reset() {
 //===--------------------------------------------------------------------===//
 
 GitFileSystem::GitFileSystem() {
-    // Initialize libgit2
-    git_libgit2_init();
+    // libgit2 is initialized at extension load time
 }
 
 GitFileSystem::~GitFileSystem() {
@@ -194,8 +193,7 @@ GitFileSystem::~GitFileSystem() {
     }
     repo_cache_.clear();
     
-    // Shutdown libgit2
-    git_libgit2_shutdown();
+    // libgit2 shutdown is handled at extension unload
 }
 
 bool GitFileSystem::CanHandleFile(const string &fpath) {

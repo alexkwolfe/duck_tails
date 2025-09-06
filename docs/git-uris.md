@@ -30,7 +30,8 @@ git://[repo_path/]file_path@revision
   - Branch: `@main`, `@feature/new-thing`
   - Tag: `@v1.0.0`
   - Relative refs: `@HEAD~1`, `@main^2`
-  - Ranges (for diffs): `@v1.0..v2.0` (two-dot) or `@main...feature` (three-dot)
+  - Ranges: `@v1.0..v2.0` (two-dot: commits in v2.0 but not v1.0) or `@main...feature` (three-dot: commits since merge-base)
+  - Special refs: `@HEAD~5` (5 commits before HEAD), `@--all` (all reachable commits)
 
 ## Repository Discovery
 

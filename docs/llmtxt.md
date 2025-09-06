@@ -13,14 +13,67 @@ LOAD duck_tails;
 
 All functions work with Git repositories on your local filesystem.
 
-Input formats:
-- Git URI: `git://path/to/repo/path/in/repo@revision`
-- Filesystem path: `/path/to/repo` or `.` (uses HEAD by default)
-- Two parameters: `(repo_path, ref)` where ref defaults to 'HEAD'
+### Git URIs
 
-Functions emit URIs in git:// format with absolute paths.
+Duck Tails uses a custom URI format: `git://[repo_path]/[file_path]@[ref]`
 
-Every function has an `_each` variant for LATERAL joins with column references.
+Examples:
+- `git:///home/user/myrepo@HEAD` - absolute path to repository root at HEAD
+- `git:///home/user/myrepo/src/main.cpp@36581c4` - specific file at commit
+- `git://./relative/path@main` - relative repository path at branch
+- `git://../other_repo@36581c4` - navigate to sibling repository
+- `git://../../parent/other_repo@HEAD` - navigate up and access different repo
+
+Functions that work with files return `git_file_uri` columns that can be:
+- Passed to other `_each` functions for chaining
+- Used with DuckDB readers: `read_csv()`, `read_json_auto()`, `read_parquet()`
+
+Functions that work with commits return `uri` columns for commit-specific URIs.
+
+### URI Construction
+
+The `git_uri()` helper function constructs Git URIs from components:
+
+```sql
+git_uri(repo_path VARCHAR, file_path VARCHAR, ref VARCHAR) → VARCHAR
+```
+
+Example:
+```sql
+SELECT git_uri('/home/user/repo', 'src/main.cpp', '36581c4');
+-- Returns: git:///home/user/repo/src/main.cpp@36581c4
+```
+
+This is useful for programmatically building URIs, though most workflows use the URIs returned directly by other git functions.
+
+### Input Formats & Path Resolution
+
+Functions accept either git URIs or filesystem paths that are automatically resolved:
+
+**Git URIs**: `git://path/to/repo/path/in/repo@revision`
+- Repository and file path are explicitly specified
+- Revision is embedded in the URI
+
+**Filesystem Paths**: `/path/to/repo` or `/path/to/repo/file.txt`
+- Duck Tails discovers the repository by walking up the directory tree from the given path
+- The repository root becomes `repo_path`, any additional path becomes `file_path`
+- Examples:
+  - `/home/user/repo/src/main.cpp` → repo: `/home/user/repo`, file: `src/main.cpp`
+  - `./` → repo: `./`, file: `` (empty = repository root)
+
+**Two Parameters**: `(repo_or_file_path, ref)` where ref defaults to 'HEAD'
+- Supports range syntax: `main..feature` (two-dot) or `main...feature` (three-dot)
+- Special refs: `HEAD~5`, `--all`
+
+### LATERAL Join Functions
+
+Every function has an `_each` variant designed for LATERAL joins with column references.
+These support two main usage patterns:
+
+1. **URI Chaining**: Pass `git_file_uri` or `uri` columns from other git functions
+2. **Component Assembly**: Pass separate repo_path, file_path, and commit_sha from your datasets
+
+Both approaches enable powerful data analysis across git repositories.
 
 ## Functions
 
@@ -28,8 +81,9 @@ Every function has an `_each` variant for LATERAL joins with column references.
 
 Lists files and directories in a git repository at a specific revision.
 
-Signature:
+Signatures:
 ```sql
+git_tree(git_uri_or_repo_path VARCHAR) → TABLE
 git_tree(repo_path VARCHAR, ref VARCHAR DEFAULT 'HEAD') → TABLE
 ```
 
@@ -48,29 +102,30 @@ Returns:
 
 Examples:
 ```sql
--- List all files at HEAD
+-- List all files at HEAD (traditional syntax)
 SELECT * FROM git_tree('.');
 
--- List files at specific commit
-SELECT * FROM git_tree('/path/to/repo', 'abc123');
+-- List files in subdirectory at specific commit
+SELECT * FROM git_tree('/home/user/repo/src', '36581c4');
 
--- List files at a branch
-SELECT * FROM git_tree('.', 'main');
+-- List files using git URI (equivalent to above)
+SELECT * FROM git_tree('git:///home/user/repo/src@36581c4');
+
+-- List files at a branch using git URI
+SELECT * FROM git_tree('git://.@main');
 ```
 
 ### git_tree_each
 
 LATERAL join variant of git_tree for use with column values.
 
-Signatures:
+Signature:
 ```sql
-git_tree_each(ref VARCHAR) → TABLE
-git_tree_each(ref VARCHAR, repo_path VARCHAR) → TABLE
+git_tree_each(git_uri VARCHAR) → TABLE
 ```
 
 Parameters:
-- ref: Git reference or git:// URI
-- repo_path: Repository path (optional)
+- git_uri: Git URI (git://path/to/repo@ref) from another function's output
 
 **URI Support**: Accepts git:// URIs for full composability.
 
@@ -78,14 +133,18 @@ Returns: Same as git_tree, including git_file_uri for each file
 
 Example:
 ```sql
--- Count files across multiple branches
-WITH refs AS (SELECT 'HEAD' as r UNION SELECT 'main')
+-- Count files across multiple branches using git URIs
+WITH refs AS (
+  SELECT 'git://.@HEAD' as r 
+  UNION 
+  SELECT 'git://.@main'
+)
 SELECT r, COUNT(*) as file_count
 FROM refs, LATERAL git_tree_each(r) t
 GROUP BY r;
 
 -- Use with git:// URIs
-SELECT * FROM git_tree_each('git:///repo@HEAD');
+SELECT * FROM git_tree_each('git://<repo_path>/<file_path>@<ref>');
 ```
 
 ### git_log
@@ -94,7 +153,7 @@ Returns commit history for a repository.
 
 Signature:
 ```sql
-git_log(repo_path VARCHAR, ref VARCHAR DEFAULT 'HEAD') → TABLE
+git_log(git_uri_or_repo_path VARCHAR) → TABLE
 ```
 
 Returns:
@@ -116,14 +175,20 @@ Returns:
 
 Examples:
 ```sql
--- Get last 10 commits
+-- Get last 10 commits (traditional syntax)
 SELECT * FROM git_log('.') LIMIT 10;
 
--- Get commits in a range
-SELECT * FROM git_log('main..feature');
+-- Get commits using git URI
+SELECT * FROM git_log('git:///home/user/repo@36581c4');
 
--- Three-dot range (commits in either branch but not both)
-SELECT * FROM git_log('main...feature');
+-- Get commits in a two-dot range (commits in feature not in main)
+SELECT * FROM git_log('.', 'main..feature');
+
+-- Get commits in a three-dot range (commits since common ancestor)
+SELECT * FROM git_log('.', 'main...feature');
+
+-- Get commits from subdirectory at specific commit
+SELECT * FROM git_log('git:///home/user/repo/src@main');
 ```
 
 ### git_log_each
@@ -132,7 +197,7 @@ LATERAL join variant of git_log.
 
 Signature:
 ```sql
-git_log_each(repo_path VARCHAR, ref VARCHAR) → TABLE
+git_log_each(git_uri VARCHAR) → TABLE
 ```
 
 Returns: Same as git_log
@@ -143,8 +208,10 @@ Lists all branches in a repository.
 
 Signature:
 ```sql
-git_branches(repo_path VARCHAR) → TABLE
+git_branches(git_uri_or_repo_path VARCHAR) → TABLE
 ```
+
+Note: git_branches lists all branches in a repository - it doesn't accept a ref parameter since it shows branch information, not content at a specific revision.
 
 Returns:
 - branch_name VARCHAR: Branch name
@@ -160,12 +227,15 @@ Returns:
 
 Examples:
 ```sql
--- List all local branches
+-- List all local branches (traditional syntax)
 SELECT * FROM git_branches('.')
 WHERE NOT is_remote;
 
+-- List branches using git URI
+SELECT * FROM git_branches('git:///home/user/repo@HEAD');
+
 -- Find current branch
-SELECT branch_name FROM git_branches('.')
+SELECT branch_name FROM git_branches('git://.@HEAD')
 WHERE is_head;
 ```
 
@@ -175,7 +245,7 @@ LATERAL join variant of git_branches.
 
 Signature:
 ```sql
-git_branches_each(repo_path VARCHAR) → TABLE
+git_branches_each(git_uri_or_path VARCHAR) → TABLE
 ```
 
 Returns: Same as git_branches
@@ -186,7 +256,7 @@ Lists all tags in a repository.
 
 Signature:
 ```sql
-git_tags(repo_path VARCHAR) → TABLE
+git_tags(git_uri_or_repo_path VARCHAR) → TABLE
 ```
 
 Returns:
@@ -204,11 +274,14 @@ Returns:
 
 Examples:
 ```sql
--- List all tags
+-- List all tags (traditional syntax)
 SELECT * FROM git_tags('.');
 
+-- List tags using git URI
+SELECT * FROM git_tags('git:///home/user/repo@HEAD');
+
 -- Find latest semantic version tag
-SELECT tag_name FROM git_tags('.')
+SELECT tag_name FROM git_tags('git://.@HEAD')
 WHERE tag_name SIMILAR TO 'v[0-9]+\.[0-9]+\.[0-9]+'
 ORDER BY tag_time DESC
 LIMIT 1;
@@ -220,7 +293,7 @@ LATERAL join variant of git_tags.
 
 Signature:
 ```sql
-git_tags_each(repo_path VARCHAR) → TABLE
+git_tags_each(git_uri_or_path VARCHAR) → TABLE
 ```
 
 Returns: Same as git_tags
@@ -229,9 +302,10 @@ Returns: Same as git_tags
 
 Reads file content from a git repository at a specific revision.
 
-Signature:
+Signatures:
 ```sql
-git_read(file_path VARCHAR, ref VARCHAR DEFAULT NULL) → TABLE
+git_read(git_uri_or_file_path VARCHAR) → TABLE
+git_read(file_path VARCHAR, ref VARCHAR) → TABLE
 ```
 
 Returns:
@@ -246,15 +320,18 @@ Returns:
 
 Examples:
 ```sql
--- Read README at HEAD
-SELECT text FROM git_read('README.md', 'HEAD');
+-- Read README using git URI
+SELECT text FROM git_read('git://.@HEAD/README.md');
 
--- Read file at specific commit
-SELECT * FROM git_read('/path/to/file.txt', 'abc123');
+-- Read file at specific commit (traditional syntax)
+SELECT * FROM git_read('/home/user/repo/config.json', '36581c4');
+
+-- Read file using git URI (equivalent to above)
+SELECT * FROM git_read('git:///home/user/repo/config.json@36581c4');
 
 -- Read and parse JSON
 WITH json_file AS (
-  SELECT git_file_uri FROM git_tree('HEAD:data/')
+  SELECT git_file_uri FROM git_tree('.', 'HEAD')
   WHERE path LIKE '%.json'
   LIMIT 1
 )
@@ -267,18 +344,21 @@ LATERAL join variant of git_read.
 
 Signature:
 ```sql
-git_read_each(file_path VARCHAR, ref VARCHAR) → TABLE
+git_read_each(git_uri VARCHAR) → TABLE
 ```
 
 Returns: Same as git_read
 
 Example:
 ```sql
--- Read multiple files
+-- Read multiple files using git URIs
 WITH files AS (
-  SELECT 'README.md' as f UNION SELECT 'LICENSE'
+  SELECT 'git://.@HEAD/README.md' as git_uri 
+  UNION 
+  SELECT 'git://.@HEAD/LICENSE'
 )
-SELECT f, text FROM files, LATERAL git_read_each(f, 'HEAD');
+SELECT git_uri, text 
+FROM files, LATERAL git_read_each(git_uri);
 ```
 
 ### git_parents
@@ -287,6 +367,7 @@ Returns parent commits for a given commit.
 
 Signatures:
 ```sql
+git_parents(git_uri_or_ref VARCHAR, all_refs BOOLEAN DEFAULT FALSE) → TABLE
 git_parents(repo_path VARCHAR, ref VARCHAR DEFAULT 'HEAD', all_refs BOOLEAN DEFAULT FALSE) → TABLE
 ```
 
@@ -297,15 +378,18 @@ Returns:
 
 Examples:
 ```sql
--- Get parents of HEAD
+-- Get parents of HEAD (traditional syntax)
 SELECT * FROM git_parents('.', 'HEAD');
 
+-- Get parents using git URI
+SELECT * FROM git_parents('git://.@36581c4');
+
 -- Get parents of all commits
-SELECT * FROM git_parents('.', 'HEAD', true);
+SELECT * FROM git_parents('git:///home/user/repo@HEAD', true);
 
 -- Find merge commits (commits with multiple parents)
 SELECT commit_hash, COUNT(*) as parent_count
-FROM git_parents('.', 'HEAD', true)
+FROM git_parents('git://.@HEAD', true)
 GROUP BY commit_hash
 HAVING COUNT(*) > 1;
 ```
@@ -314,15 +398,13 @@ HAVING COUNT(*) > 1;
 
 LATERAL join variant of git_parents. Accepts column references to generate parent rows for multiple commits.
 
-Signatures:
+Signature:
 ```sql
-git_parents_each(ref VARCHAR) → TABLE
-git_parents_each(ref VARCHAR, repo_path VARCHAR) → TABLE
+git_parents_each(git_uri VARCHAR) → TABLE
 ```
 
 Parameters:
-- ref: Commit reference (hash, branch, tag) or git:// URI
-- repo_path: Repository path (optional, defaults to current directory)
+- git_uri: Git URI (git://path/to/repo@ref) from another function's output
 
 Returns: Same as git_parents
 
@@ -330,16 +412,17 @@ Returns: Same as git_parents
 
 Examples:
 ```sql
--- Get parents for multiple commits
+-- Get parents for multiple commits using URIs
 WITH commits AS (
-  SELECT commit_hash FROM git_log('.') LIMIT 10
+  SELECT 'git://.@' || commit_hash as commit_uri
+  FROM git_log('.') LIMIT 10
 )
-SELECT c.commit_hash, p.parent_hash, p.parent_index
-FROM commits c, LATERAL git_parents_each(c.commit_hash, '.') p;
+SELECT c.commit_uri, p.parent_hash, p.parent_index
+FROM commits c, LATERAL git_parents_each(c.commit_uri) p;
 
--- Use with git:// URIs from other functions
+-- Chain with other functions using git URIs
 WITH commits AS (
-  SELECT 'git://' || '/repo' || '@' || commit_hash as git_uri
+  SELECT 'git:///repo@' || commit_hash as git_uri
   FROM git_log('/repo')
 )
 SELECT * FROM commits c
@@ -365,6 +448,58 @@ SELECT git_uri('/path/to/repo', 'src/main.cpp', 'HEAD');
 
 ## Common Patterns
 
+### LATERAL Join Usage Scenarios
+
+#### Scenario 1: URI Chaining from git functions
+Use `git_file_uri` or `uri` columns from git functions to chain operations:
+
+```sql
+-- Read files discovered by git_tree
+SELECT t.path, r.text
+FROM git_tree('.', 'HEAD') t,
+LATERAL git_read_each(t.git_file_uri) r
+WHERE t.type = 'blob' AND t.path LIKE '%.json';
+
+-- Get commit history for files
+SELECT t.path, l.commit_hash, l.commit_message
+FROM git_tree('.', 'HEAD') t,
+LATERAL git_log_each(t.git_file_uri) l
+WHERE t.type = 'blob';
+```
+
+#### Scenario 2: Component Assembly from datasets
+Use separate repo_path, file_path, and commit columns from your data:
+
+```sql
+-- Your dataset with file versions
+WITH file_versions AS (
+  SELECT '/home/user/repo' as repo_path,
+         'config.json' as file_path, 
+         '36581c4' as commit_sha
+  UNION ALL
+  SELECT '/home/user/other_repo' as repo_path,
+         'package.json' as file_path,
+         'main' as commit_sha
+)
+-- Read each file using git_uri construction
+SELECT fv.repo_path, fv.file_path, r.text
+FROM file_versions fv,
+LATERAL git_read_each(git_uri(fv.repo_path, fv.file_path, fv.commit_sha)) r;
+```
+
+#### Scenario 3: Multi-Level Function Chaining
+Chain 3+ functions together using URIs for deep analysis:
+
+```sql
+-- Chain git_tree → git_log_each → git_parents_each
+SELECT t.path, l.commit_hash, p.parent_hash
+FROM git_tree('.', 'HEAD') t,
+LATERAL git_log_each(t.git_file_uri) l,
+LATERAL git_parents_each(l.uri) p
+WHERE t.type = 'blob' AND t.path LIKE '%.cpp'
+LIMIT 100;
+```
+
 ### URI Composability with LATERAL Joins
 
 All `_each` functions support git:// URIs, enabling powerful composability:
@@ -374,19 +509,19 @@ All `_each` functions support git:// URIs, enabling powerful composability:
 SELECT 
   t.path, 
   COUNT(l.commit_hash) as commits
-FROM git_tree('HEAD', repo_path => '/repo') t
+FROM git_tree('/repo', 'HEAD') t
 CROSS JOIN LATERAL git_log_each(t.git_file_uri) l
 GROUP BY t.path;
 
 -- Chain multiple functions using URIs
 WITH tree_files AS (
   SELECT path, git_file_uri 
-  FROM git_tree('HEAD', repo_path => '/repo')
+  FROM git_tree('/repo', 'HEAD')
 ),
 file_commits AS (
   SELECT 
     tf.path,
-    'git://' || '/repo' || '@' || l.commit_hash as commit_uri,
+    'git:///repo@' || l.commit_hash as commit_uri,
     l.commit_hash
   FROM tree_files tf
   CROSS JOIN LATERAL git_log_each(tf.git_file_uri) l
@@ -454,8 +589,8 @@ ORDER BY file_count DESC;
 -- Analyze CSV files in repository
 WITH csv_files AS (
   SELECT git_file_uri, path
-  FROM git_tree('HEAD:data/')
-  WHERE path LIKE '%.csv'
+  FROM git_tree('.', 'HEAD')
+  WHERE path LIKE 'data/%.csv'
 )
 SELECT 
   cf.path,
@@ -485,35 +620,27 @@ WHERE v1.blob_hash != v2.blob_hash;
 The git_file_uri output can be passed to DuckDB's built-in readers:
 
 ```sql
--- Read CSV from git
+-- Read CSV from git using git URIs
 WITH data_file AS (
-  SELECT git_file_uri FROM git_tree('HEAD:data/')
-  WHERE path = 'sales.csv'
+  SELECT git_file_uri FROM git_tree('.', 'HEAD')
+  WHERE path = 'data/sales.csv'
 )
 SELECT * FROM data_file, LATERAL read_csv(data_file.git_file_uri);
 
 -- Read JSON from git
 WITH config AS (
-  SELECT git_file_uri FROM git_tree('HEAD')
+  SELECT git_file_uri FROM git_tree('.', 'HEAD')
   WHERE path = 'config.json'
 )
 SELECT * FROM config, LATERAL read_json_auto(config.git_file_uri);
 
 -- Read Parquet from git
 WITH dataset AS (
-  SELECT git_file_uri FROM git_tree('main:datasets/')
-  WHERE path LIKE '%.parquet'
+  SELECT git_file_uri FROM git_tree('.', 'main')
+  WHERE path LIKE 'datasets/%.parquet'
 )
 SELECT * FROM dataset, LATERAL read_parquet(dataset.git_file_uri);
 ```
-
-## Performance Considerations
-
-- Repository discovery walks up directory tree, cache results when possible
-- Large repositories may be slow to traverse, use path filters
-- Range queries (main..feature) must walk commit history
-- File content is loaded into memory, be careful with large files
-- Use LIMIT clauses when exploring unfamiliar repositories
 
 ### git_clone
 
@@ -611,6 +738,14 @@ FROM repositories r, LATERAL git_clone_each(r.url, 'repos/' || RIGHT(r.url, 20))
 - No support for git submodules in cloned repositories
 - Binary file content returned as BLOB, text extraction depends on encoding
 - Maximum file size limited by available memory
+
+## Performance Considerations
+
+- Repository discovery walks up directory tree, cache results when possible
+- Large repositories may be slow to traverse, use path filters
+- Range queries (main..feature) must walk commit history
+- File content is loaded into memory, be careful with large files
+- Use LIMIT clauses when exploring unfamiliar repositories
 
 ## Error Handling
 

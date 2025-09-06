@@ -1,5 +1,6 @@
 #include "git_functions.hpp"
 #include "git_filesystem.hpp"
+#include "git_utils.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/main/extension_util.hpp"
@@ -102,17 +103,20 @@ static UnifiedGitParams ParseLateralGitParams(TableFunctionBindInput &input, int
 // Schema definition for git_tree (ALWAYS includes repo_path as first column)
 static void DefineGitTreeSchema(vector<LogicalType> &return_types, vector<string> &names) {
     return_types = {
-        LogicalType::VARCHAR,    // repo_path (ALWAYS first)
+        LogicalType::VARCHAR,    // git_uri (renamed from git_file_uri, moved to front)
+        LogicalType::VARCHAR,    // repo_path
+        LogicalType::VARCHAR,    // file_path
+        LogicalType::VARCHAR,    // file_ext
+        LogicalType::VARCHAR,    // ref
+        LogicalType::VARCHAR,    // blob_hash
         LogicalType::VARCHAR,    // commit_hash
         LogicalType::TIMESTAMP,  // commit_date
         LogicalType::VARCHAR,    // path
         LogicalType::INTEGER,    // mode
-        LogicalType::VARCHAR,    // blob_hash
-        LogicalType::BIGINT,     // size
-        LogicalType::VARCHAR     // git_file_uri
+        LogicalType::BIGINT      // size
     };
-    names = {"repo_path", "commit_hash", "commit_date", "path", "mode", 
-             "blob_hash", "size", "git_file_uri"};
+    names = {"git_uri", "repo_path", "file_path", "file_ext", "ref", "blob_hash", 
+             "commit_hash", "commit_date", "path", "mode", "size"};
 }
 
 // Schema definition for git_parents (ALWAYS includes repo_path as first column)
@@ -130,14 +134,17 @@ static void DefineGitParentsSchema(vector<LogicalType> &return_types, vector<str
 static void OutputGitTreeRow(DataChunk &output, idx_t row_idx, 
                              const GitTreeRow &row, const string &repo_path) {
     idx_t col = 0;
+    output.SetValue(col++, row_idx, Value(row.git_file_uri));       // git_uri
     output.SetValue(col++, row_idx, Value(repo_path));              // repo_path
+    output.SetValue(col++, row_idx, Value(row.file_path));          // file_path
+    output.SetValue(col++, row_idx, Value(row.file_ext));           // file_ext
+    output.SetValue(col++, row_idx, Value(row.ref));                // ref
+    output.SetValue(col++, row_idx, Value(row.blob_hash));          // blob_hash
     output.SetValue(col++, row_idx, Value(row.commit_hash));        // commit_hash
     output.SetValue(col++, row_idx, Value::TIMESTAMP(row.commit_date)); // commit_date
     output.SetValue(col++, row_idx, Value(row.path));               // path
     output.SetValue(col++, row_idx, Value::INTEGER(row.mode));      // mode
-    output.SetValue(col++, row_idx, Value(row.blob_hash));          // blob_hash
     output.SetValue(col++, row_idx, Value::BIGINT(row.size));       // size
-    output.SetValue(col++, row_idx, Value(row.git_file_uri));       // git_file_uri
 }
 
 // Output helper for git_parents rows (repo_path is REQUIRED)
@@ -575,6 +582,36 @@ static string BuildGitFileUri(const string &repo_path, const string &file_path, 
     return ConstructGitUri(repo_path, file_path, commit_hash);
 }
 
+// Helper function to extract file extension from a file path
+static string ExtractFileExtension(const string &file_path) {
+    if (file_path.empty()) {
+        return "";
+    }
+    
+    size_t dot_pos = file_path.find_last_of('.');
+    size_t slash_pos = file_path.find_last_of('/');
+    
+    // Make sure the dot is after the last slash (to handle directories like "dir.name/file")
+    if (dot_pos != string::npos && (slash_pos == string::npos || dot_pos > slash_pos)) {
+        return file_path.substr(dot_pos);  // Include the dot
+    }
+    
+    return "";  // No extension found
+}
+
+// Helper function to parse git URI components
+static void ParseGitUriComponents(const string &git_uri, string &file_path, string &ref) {
+    try {
+        auto git_path = GitPath::Parse(git_uri);
+        file_path = git_path.file_path;
+        ref = git_path.revision.empty() ? "HEAD" : git_path.revision;
+    } catch (const std::exception &e) {
+        // Fallback if parsing fails
+        file_path = "";
+        ref = "HEAD";
+    }
+}
+
 static void traverse_tree(git_repository *repo, git_tree *tree, const string &base, vector<GitTreeRow> &out, 
                           const string &commit_hash, timestamp_t commit_date, const string &repo_path) {
     const size_t count = git_tree_entrycount(tree);
@@ -595,7 +632,14 @@ static void traverse_tree(git_repository *repo, git_tree *tree, const string &ba
                 git_blob_free(blob);
             }
             string git_file_uri = BuildGitFileUri(repo_path, path, commit_hash);
-            out.push_back(GitTreeRow{commit_hash, commit_date, path, mode, oid_to_hex(oid), size, git_file_uri});
+            
+            // Parse the git URI to extract components for new columns
+            string extracted_file_path, extracted_ref;
+            ParseGitUriComponents(git_file_uri, extracted_file_path, extracted_ref);
+            string file_ext = ExtractFileExtension(path);
+            
+            out.push_back(GitTreeRow{commit_hash, commit_date, path, mode, oid_to_hex(oid), size, git_file_uri, 
+                                   extracted_file_path, file_ext, extracted_ref});
         } else if (type == GIT_OBJECT_TREE) {
             git_tree *subtree = nullptr;
             if (git_tree_lookup(&subtree, repo, oid) == 0) {
@@ -790,13 +834,12 @@ unique_ptr<FunctionData> GitTagsEachBind(ClientContext &context, TableFunctionBi
 unique_ptr<GlobalTableFunctionState> GitTreeInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
     auto &bind_data = const_cast<GitTreeFunctionData&>(input.bind_data->Cast<GitTreeFunctionData>());
     
-    git_libgit2_init();
+    // libgit2 is initialized at extension load time
     
     git_repository *repo = nullptr;
     int error = git_repository_open(&repo, bind_data.repo_path.c_str());
     if (error != 0) {
         const git_error *e = git_error_last();
-        git_libgit2_shutdown();
         throw IOException("git_tree: failed to open git repository '%s': %s", 
                         bind_data.repo_path, e ? e->message : "Unknown error");
     }
@@ -834,7 +877,6 @@ unique_ptr<GlobalTableFunctionState> GitTreeInitGlobal(ClientContext &context, T
         }
     } catch (...) {
         git_repository_free(repo);
-        git_libgit2_shutdown();
         throw;
     }
 
@@ -842,7 +884,6 @@ unique_ptr<GlobalTableFunctionState> GitTreeInitGlobal(ClientContext &context, T
     bind_data.rows = std::move(rows);
 
     git_repository_free(repo);
-    git_libgit2_shutdown();
 
     return make_uniq<GlobalTableFunctionState>();
 }
@@ -888,27 +929,24 @@ static unique_ptr<LocalTableFunctionState> GitTreeInOutInit(ExecutionContext &co
 }
 
 static void ProcessCommitForInOut(const string &commit_hash, const string &repo_path, vector<GitTreeRow> &rows) {
-    git_libgit2_init();
+    // libgit2 is initialized at extension load time
     git_repository *repo = nullptr;
     
     try {
         if (git_repository_open(&repo, repo_path.c_str()) != 0) {
-            git_libgit2_shutdown();
-            return;
+                return;
         }
         
         git_oid oid;
         if (git_oid_fromstr(&oid, commit_hash.c_str()) != 0) {
             git_repository_free(repo);
-            git_libgit2_shutdown();
-            return;
+                return;
         }
         
         git_commit *commit = nullptr;
         if (git_commit_lookup(&commit, repo, &oid) != 0) {
             git_repository_free(repo);
-            git_libgit2_shutdown();
-            return;
+                return;
         }
         
         timestamp_t commit_date = Timestamp::FromEpochSeconds(git_commit_time(commit));
@@ -917,8 +955,7 @@ static void ProcessCommitForInOut(const string &commit_hash, const string &repo_
         if (git_commit_tree(&tree, commit) != 0) {
             git_commit_free(commit);
             git_repository_free(repo);
-            git_libgit2_shutdown();
-            return;
+                return;
         }
         
         // Use existing traverse_tree function to populate rows
@@ -927,11 +964,9 @@ static void ProcessCommitForInOut(const string &commit_hash, const string &repo_
         git_tree_free(tree);
         git_commit_free(commit);
         git_repository_free(repo);
-        git_libgit2_shutdown();
         
     } catch (...) {
         if (repo) git_repository_free(repo);
-        git_libgit2_shutdown();
     }
 }
 
@@ -1028,13 +1063,12 @@ unique_ptr<FunctionData> GitParentsBind(ClientContext &context, TableFunctionBin
 unique_ptr<GlobalTableFunctionState> GitParentsInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
     auto &bind_data = const_cast<GitParentsFunctionData&>(input.bind_data->Cast<GitParentsFunctionData>());
     
-    git_libgit2_init();
+    // libgit2 is initialized at extension load time
     
     git_repository *repo = nullptr;
     int error = git_repository_open(&repo, bind_data.repo_path.c_str());
     if (error != 0) {
         const git_error *e = git_error_last();
-        git_libgit2_shutdown();
         throw IOException("git_parents: failed to open git repository '%s': %s", 
                         bind_data.repo_path, e ? e->message : "Unknown error");
     }
@@ -1060,8 +1094,7 @@ unique_ptr<GlobalTableFunctionState> GitParentsInitGlobal(ClientContext &context
             const git_error *e = git_error_last();
             git_revwalk_free(walk);
             git_repository_free(repo);
-            git_libgit2_shutdown();
-            throw IOException("git_parents: cannot resolve ref '%s' in repository '%s': %s", 
+                throw IOException("git_parents: cannot resolve ref '%s' in repository '%s': %s", 
                             bind_data.ref, bind_data.repo_path, e ? e->message : "Unknown error");
         }
         git_oid oid = *git_object_id(obj);
@@ -1094,7 +1127,6 @@ unique_ptr<GlobalTableFunctionState> GitParentsInitGlobal(ClientContext &context
 
     git_revwalk_free(walk);
     git_repository_free(repo);
-    git_libgit2_shutdown();
 
     return make_uniq<GlobalTableFunctionState>();
 }
@@ -1128,7 +1160,7 @@ static void ProcessLogCommitForInOut(const string &input_repo_path, const string
     // Use input_repo_path from LATERAL context, or bind_repo_path as fallback
     string repo_path = input_repo_path.empty() ? bind_repo_path : input_repo_path;
     
-    git_libgit2_init();
+    // libgit2 is initialized at extension load time
     
     // Use GitPath::Parse to resolve repository path  
     string resolved_repo_path;
@@ -1225,7 +1257,7 @@ static OperatorResultType GitLogEachFunction(ExecutionContext &context, TableFun
     auto &state = data_p.local_state->Cast<GitLogLocalState>();
     
     // Declare resolved_repo_path at function scope so it's accessible in output loop
-    static string resolved_repo_path;
+    string resolved_repo_path;
     
     while (true) {
         if (!state.initialized_row) {
@@ -1443,7 +1475,7 @@ static OperatorResultType GitBranchesEachFunction(ExecutionContext &context, Tab
     auto &state = data_p.local_state->Cast<GitBranchesLocalState>();
     
     // Declare resolved_repo_path at function scope so it's accessible in output loop
-    static string resolved_repo_path;
+    string resolved_repo_path;
     
     while (true) {
         if (!state.initialized_row) {
@@ -1656,7 +1688,7 @@ static OperatorResultType GitTagsEachFunction(ExecutionContext &context, TableFu
     auto &state = data_p.local_state->Cast<GitTagsLocalState>();
     
     // Declare resolved_repo_path at function scope so it's accessible in output loop
-    static string resolved_repo_path;
+    string resolved_repo_path;
     
     while (true) {
         if (!state.initialized_row) {
@@ -1855,13 +1887,12 @@ unique_ptr<LocalTableFunctionState> GitTreeLocalInit(ExecutionContext &context,
 
 // Helper function for LATERAL git_tree_each processing
 static void ProcessTreeCommitForInOut(const string &commit_ref, const string &repo_path, vector<GitTreeRow> &rows) {
-    git_libgit2_init();
+    // libgit2 is initialized at extension load time
     git_repository *repo = nullptr;
     
     try {
         if (git_repository_open(&repo, repo_path.c_str()) != 0) {
-            git_libgit2_shutdown();
-            return;
+                return;
         }
         
         ProcessSingleCommit(repo, commit_ref, repo_path, rows);
@@ -1872,7 +1903,6 @@ static void ProcessTreeCommitForInOut(const string &commit_ref, const string &re
         }
     }
     
-    git_libgit2_shutdown();
 }
 
 static OperatorResultType GitTreeEachFunction(ExecutionContext &context, TableFunctionInput &data_p,
@@ -1881,7 +1911,7 @@ static OperatorResultType GitTreeEachFunction(ExecutionContext &context, TableFu
     auto &state = data_p.local_state->Cast<GitTreeLocalState>();
     
     // Declare resolved_repo_path at function scope so it's accessible in output loop
-    static string resolved_repo_path;
+    string resolved_repo_path;
     
     while (true) {
         if (!state.initialized_row) {
@@ -2059,13 +2089,12 @@ void RegisterGitTreeFunction(DatabaseInstance &db) {
 
 // Helper function for processing parents of a single commit
 static void ProcessParentsForCommit(const string &repo_path, const string &commit_ref, vector<GitParentsRow> &rows) {
-    git_libgit2_init();
+    // libgit2 is initialized at extension load time
     
     git_repository *repo = nullptr;
     int error = git_repository_open(&repo, repo_path.c_str());
     if (error != 0) {
         const git_error *e = git_error_last();
-        git_libgit2_shutdown();
         throw IOException("git_parents_each: failed to open repository '%s': %s", 
                         repo_path, e ? e->message : "Unknown error");
     }
@@ -2075,7 +2104,6 @@ static void ProcessParentsForCommit(const string &repo_path, const string &commi
     if (git_revparse_single(&obj, repo, commit_ref.c_str()) != 0) {
         const git_error *e = git_error_last();
         git_repository_free(repo);
-        git_libgit2_shutdown();
         throw IOException("git_parents_each: cannot resolve ref '%s' in repository '%s': %s", 
                         commit_ref, repo_path, e ? e->message : "Unknown error");
     }
@@ -2084,14 +2112,12 @@ static void ProcessParentsForCommit(const string &repo_path, const string &commi
     if (git_object_type(obj) != GIT_OBJECT_COMMIT) {
         git_object_free(obj);
         git_repository_free(repo);
-        git_libgit2_shutdown();
         throw IOException("git_parents_each: '%s' does not refer to a commit", commit_ref);
     }
     
     if (git_commit_lookup(&commit, repo, git_object_id(obj)) != 0) {
         git_object_free(obj);
         git_repository_free(repo);
-        git_libgit2_shutdown();
         throw IOException("git_parents_each: failed to lookup commit");
     }
     
@@ -2119,7 +2145,6 @@ static void ProcessParentsForCommit(const string &repo_path, const string &commi
     git_commit_free(commit);
     git_object_free(obj);
     git_repository_free(repo);
-    git_libgit2_shutdown();
 }
 
 // Bind function for git_parents_each

@@ -98,7 +98,7 @@ GitCloneRow PerformGitPull(ClientContext &context, const string &repo_path, cons
         
         // Set up fetch options
         git_fetch_options fetch_opts = GIT_FETCH_OPTIONS_INIT;
-        fetch_opts.callbacks.progress = nullptr;
+        // Note: progress callback not available in this libgit2 version
         
         // Perform fetch
         error = git_remote_fetch(remote, nullptr, &fetch_opts, nullptr);
@@ -345,17 +345,15 @@ unique_ptr<FunctionData> GitCloneBind(ClientContext &context, TableFunctionBindI
         
         if (options_arg && !options_arg->IsNull()) {
             // Parse struct options
-            auto &struct_value = options_arg->GetValue<list_entry_t>();
             auto &struct_children = ListValue::GetChildren(*options_arg);
+            auto &child_types = StructType::GetChildTypes(options_arg->type());
             
-            for (idx_t i = 0; i < struct_children.size(); i++) {
+            for (idx_t i = 0; i < struct_children.size() && i < child_types.size(); i++) {
                 auto &child = struct_children[i];
                 if (child.IsNull()) continue;
                 
                 // Get field name from struct type
-                auto &struct_type = options_arg->type().AuxInfo()->Cast<StructTypeInfo>();
-                if (i >= struct_type.child_names.size()) continue;
-                auto &field_name = struct_type.child_names[i];
+                auto &field_name = child_types[i].first;
                 
                 if (field_name == "branch" && child.type().id() == LogicalTypeId::VARCHAR) {
                     bind_data->branch = StringValue::Get(child);
@@ -509,13 +507,13 @@ OperatorResultType GitCloneEachFunction(ExecutionContext &context, TableFunction
             output.SetCardinality(1);
             
             // Fill output columns with current result
-            FlatVector::GetData<string_t>(output.data[0])[0] = StringVector::AddString(output, state.current_result.url);
-            FlatVector::GetData<string_t>(output.data[1])[0] = StringVector::AddString(output, state.current_result.local_path);
-            FlatVector::GetData<string_t>(output.data[2])[0] = StringVector::AddString(output, state.current_result.status);
-            FlatVector::GetData<string_t>(output.data[3])[0] = StringVector::AddString(output, state.current_result.action);
-            FlatVector::GetData<string_t>(output.data[4])[0] = StringVector::AddString(output, state.current_result.message);
-            FlatVector::GetData<string_t>(output.data[5])[0] = StringVector::AddString(output, state.current_result.commit_hash);
-            FlatVector::GetData<string_t>(output.data[6])[0] = StringVector::AddString(output, state.current_result.previous_hash);
+            FlatVector::GetData<string_t>(output.data[0])[0] = StringVector::AddString(output.data[0], state.current_result.url);
+            FlatVector::GetData<string_t>(output.data[1])[0] = StringVector::AddString(output.data[1], state.current_result.local_path);
+            FlatVector::GetData<string_t>(output.data[2])[0] = StringVector::AddString(output.data[2], state.current_result.status);
+            FlatVector::GetData<string_t>(output.data[3])[0] = StringVector::AddString(output.data[3], state.current_result.action);
+            FlatVector::GetData<string_t>(output.data[4])[0] = StringVector::AddString(output.data[4], state.current_result.message);
+            FlatVector::GetData<string_t>(output.data[5])[0] = StringVector::AddString(output.data[5], state.current_result.commit_hash);
+            FlatVector::GetData<string_t>(output.data[6])[0] = StringVector::AddString(output.data[6], state.current_result.previous_hash);
             FlatVector::GetData<timestamp_t>(output.data[7])[0] = state.current_result.commit_time;
             FlatVector::GetData<int64_t>(output.data[8])[0] = state.current_result.size_bytes;
             
@@ -544,13 +542,13 @@ void GitCloneFunction(ClientContext &context, TableFunctionInput &data_p, DataCh
     output.SetCardinality(1);
     
     // Fill output columns
-    FlatVector::GetData<string_t>(output.data[0])[0] = StringVector::AddString(output, result.url);
-    FlatVector::GetData<string_t>(output.data[1])[0] = StringVector::AddString(output, result.local_path);
-    FlatVector::GetData<string_t>(output.data[2])[0] = StringVector::AddString(output, result.status);
-    FlatVector::GetData<string_t>(output.data[3])[0] = StringVector::AddString(output, result.action);
-    FlatVector::GetData<string_t>(output.data[4])[0] = StringVector::AddString(output, result.message);
-    FlatVector::GetData<string_t>(output.data[5])[0] = StringVector::AddString(output, result.commit_hash);
-    FlatVector::GetData<string_t>(output.data[6])[0] = StringVector::AddString(output, result.previous_hash);
+    FlatVector::GetData<string_t>(output.data[0])[0] = StringVector::AddString(output.data[0], result.url);
+    FlatVector::GetData<string_t>(output.data[1])[0] = StringVector::AddString(output.data[1], result.local_path);
+    FlatVector::GetData<string_t>(output.data[2])[0] = StringVector::AddString(output.data[2], result.status);
+    FlatVector::GetData<string_t>(output.data[3])[0] = StringVector::AddString(output.data[3], result.action);
+    FlatVector::GetData<string_t>(output.data[4])[0] = StringVector::AddString(output.data[4], result.message);
+    FlatVector::GetData<string_t>(output.data[5])[0] = StringVector::AddString(output.data[5], result.commit_hash);
+    FlatVector::GetData<string_t>(output.data[6])[0] = StringVector::AddString(output.data[6], result.previous_hash);
     FlatVector::GetData<timestamp_t>(output.data[7])[0] = result.commit_time;
     FlatVector::GetData<int64_t>(output.data[8])[0] = result.size_bytes;
 }
