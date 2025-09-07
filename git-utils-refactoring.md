@@ -2,7 +2,12 @@
 
 ## Overview
 
-This document outlines a comprehensive refactoring to extract common git operations into a shared `git_utils` module. This refactoring must be completed **before** the URI schema standardization work, as it provides the foundation utilities needed for consistent URI handling across all functions.
+**⚠️ CURRENT RECOMMENDATION: This refactoring path is NOT recommended. Proceed directly to URI schema work using `uri-clarity.md` instead.**
+
+This document outlines an alternative **incremental, risk-managed** approach to extracting common git operations before URI schema work. After analysis, this approach is more complex than necessary for achieving URI consistency goals.
+
+**Current Status: Alternative path (not recommended)**
+**Recommended Path: Direct URI schema work with inline utilities as needed**
 
 ## Current State Analysis
 
@@ -242,94 +247,82 @@ bool IsValidGitUri(const string &uri);
 bool IsValidGitRef(GitRepository &repo, const string &ref);
 ```
 
-## Implementation Plan
+## Implementation Plan: Incremental & Risk-Managed
 
-### Phase 0.0: Discovery & Environment Analysis (30 minutes) **NEW**
+### ~~Phase 0: Discovery & Go/No-Go Decision~~ **DECISION MADE: NO-GO**
 
-**Critical Prerequisites - Must be completed first:**
+**DECISION OUTCOME: Refactoring path rejected in favor of direct URI schema work.**
 
-1. **Build System Analysis:**
-```bash
-# Primary build file: /Users/alex/Dev/duck_tails/CMakeLists.txt
-# Extension sources: set(EXTENSION_SOURCES src/duck_tails_extension.cpp src/git_filesystem.cpp src/git_functions.cpp src/git_clone.cpp src/text_diff.cpp)
-# libgit2 already linked: libgit2::libgit2package
-```
+**Analysis Results:**
+- 14 different OID conversion implementations found (high complexity)
+- Build currently broken with StringVector API issues
+- URI schema work can proceed without refactoring
+- Risk/reward analysis favors direct implementation
 
-2. **Test Framework Discovery:**
-```bash
-# Uses Catch2: /Users/alex/Dev/duck_tails/duckdb/third_party/catch/catch.hpp
-# Test file pattern: /Users/alex/Dev/duck_tails/test/test_basic.cpp
-# Test macros: TEST_CASE(...), REQUIRE(...) - Catch2 syntax, not Google Test
-```
+**Selected Path:** Direct URI schema work using `uri-clarity.md` with `refactoring-danger-zones.md` as safety guide.
 
-3. **Existing Git Integration Analysis:**
-```bash
-# Existing GitPath class in git_filesystem.hpp - MUST integrate, not duplicate
-# Existing git operations in git_functions.cpp - patterns to preserve
-# libgit2 version and capabilities used
-```
+**This document is retained for reference only - implementation should use `uri-clarity.md`**
 
-4. **Namespace Analysis:**
+### ~~Phase 1-3: All Refactoring Phases~~ **CANCELLED**
+
+**All refactoring phases cancelled in favor of direct URI schema work.**
+
+**Rationale:**
+- Analysis revealed 14 different OID conversion patterns (too complex)
+- Build is currently broken, need to fix existing issues first
+- URI schema work achieves the goal without this complexity
+- Ghost bug risks are better managed through the danger zones document
+
+**Implementation Path:** Use `uri-clarity.md` instead of this document.
+
+**Test approach (Catch2 format):**
 ```cpp
-// Current pattern: namespace duckdb { ... } - single namespace
-// NOT: namespace duckdb { namespace git_utils { } } - would break convention
-```
-
-**Discovery Tasks:**
-```bash
-# 1. Check libgit2 version and thread safety
-pkg-config --modversion libgit2
-rg -n "git_threads_init|git_libgit2_init" src/
-
-# 2. Find existing git error handling patterns  
-rg -A3 -B3 "git_error_last|IOException.*git" src/
-
-# 3. Map existing GitPath integration points
-rg -n "GitPath::" src/
-
-# 4. Check for existing RAII patterns in DuckDB
-rg -n "class.*RAII|unique_ptr.*git" src/
-```
-
-### Phase 0.1: Create Module Structure (30 minutes)
-
-**Files to create:**
-```
-src/include/git_utils.hpp    - Header with all declarations
-src/git_utils.cpp           - Implementation  
-test/test_git_utils.cpp      - Unit tests (Catch2 format)
-```
-
-**Update build system in CMakeLists.txt:**
-```cmake
-# Line 18: Update EXTENSION_SOURCES
-set(EXTENSION_SOURCES 
-    src/duck_tails_extension.cpp 
-    src/git_filesystem.cpp 
-    src/git_functions.cpp 
-    src/git_utils.cpp         # NEW
-    src/git_clone.cpp 
-    src/text_diff.cpp)
-```
-
-### Phase 0.2: Implement RAII Wrappers (1 hour)
-
-**Priority order:**
-1. `GitRepository` - Used by everything
-2. `GitCommit` - Used by most functions  
-3. `GitTree` - Used by tree operations
-4. Error handling utilities
-
-**Test approach:**
-```cpp
-TEST(GitUtils, GitRepositoryRAII) {
+TEST_CASE("GitRepository RAII", "[git_utils]") {
     {
         GitRepository repo(".");
-        ASSERT_TRUE(repo.is_valid());
+        REQUIRE(repo.is_valid());
         // Repo automatically freed when out of scope
     }
     // Test that repository was properly freed
 }
+```
+
+**Critical RAII Design Considerations:**
+
+1. **Constructor Error Handling Strategy:**
+```cpp
+class GitRepository {
+private:
+    git_repository *repo_;
+    bool valid_;
+public:
+    // NO throwing constructor - use explicit validation
+    explicit GitRepository(const string &path) : repo_(nullptr), valid_(false) {
+        int error = git_repository_open(&repo_, path.c_str());
+        valid_ = (error == 0 && repo_ != nullptr);
+        // Don't throw - caller checks is_valid()
+    }
+    
+    bool is_valid() const { return valid_ && repo_ != nullptr; }
+};
+```
+
+2. **Move Semantics Safety:**
+```cpp
+// git2 objects may have internal callbacks/state
+// Use simpler transfer semantics instead of complex move
+GitRepository(GitRepository&& other) noexcept 
+    : repo_(other.repo_), valid_(other.valid_) {
+    other.repo_ = nullptr;
+    other.valid_ = false;
+    // This is safe for libgit2 objects
+}
+```
+
+3. **Thread Safety Considerations:**
+```cpp
+// Check if libgit2 was initialized with threading support
+// Some git operations may need serialization
 ```
 
 ### Phase 0.3: Implement Hash Resolution (1.5 hours)
@@ -341,19 +334,45 @@ TEST(GitUtils, GitRepositoryRAII) {
 4. `GetBlobHashForFile()` - File-specific blob lookup
 5. `ResolveFileHashes()` - Combined operation
 
-**Testing strategy:**
+**Testing strategy (Catch2 format):**
 ```cpp
-TEST(GitUtils, ResolveFileHashes) {
+TEST_CASE("Resolve file hashes", "[git_utils]") {
     GitRepository repo(".");
+    REQUIRE(repo.is_valid());  // Fail fast if no git repo
+    
     auto hashes = ResolveFileHashes(repo, "HEAD", "README.md");
     
-    ASSERT_FALSE(hashes.commit_hash.empty());
-    ASSERT_FALSE(hashes.tree_hash.empty());  
-    ASSERT_FALSE(hashes.blob_hash.empty());
+    REQUIRE_FALSE(hashes.commit_hash.empty());
+    REQUIRE_FALSE(hashes.tree_hash.empty());  
+    REQUIRE_FALSE(hashes.blob_hash.empty());
     
     // Verify hashes are valid SHA format
-    ASSERT_EQ(hashes.commit_hash.length(), 40);
-    ASSERT_TRUE(std::all_of(hashes.commit_hash.begin(), hashes.commit_hash.end(), ::isxdigit));
+    REQUIRE(hashes.commit_hash.length() == 40);
+    REQUIRE(std::all_of(hashes.commit_hash.begin(), hashes.commit_hash.end(), ::isxdigit));
+}
+```
+
+**Critical Hash Resolution Implementation Notes:**
+
+1. **Integration with Existing GitPath:**
+```cpp
+// DON'T duplicate GitPath::Parse - integrate with it
+GitObjectHashes ResolveFileHashes(const string &git_uri) {
+    auto git_path = GitPath::Parse(git_uri);  // Use existing parsing
+    GitRepository repo(git_path.repository_path);
+    // ... resolve hashes using git_path components
+}
+```
+
+2. **Error Handling Strategy:**
+```cpp
+// Define git error -> DuckDB exception mapping
+void ThrowGitError(const string &operation, const string &context = "") {
+    const git_error *e = git_error_last();
+    string msg = StringUtil::Format("Git operation '%s' failed", operation);
+    if (!context.empty()) msg += StringUtil::Format(" (%s)", context);
+    if (e) msg += StringUtil::Format(": %s", e->message);
+    throw IOException(msg);
 }
 ```
 
@@ -365,16 +384,44 @@ TEST(GitUtils, ResolveFileHashes) {
 3. `ParseGitUriComponents()` - Complete existing function
 4. `ParseAndResolveGitUri()` - New comprehensive function
 
-**Testing strategy:**
+**Testing strategy (Catch2 format):**
 ```cpp
-TEST(GitUtils, ParseAndResolveGitUri) {
+TEST_CASE("Parse and resolve git URI", "[git_utils]") {
     auto components = ParseAndResolveGitUri("git://./src/main.cpp@HEAD");
     
-    ASSERT_EQ(components.file_ext, ".cpp");
-    ASSERT_EQ(components.file_path, "src/main.cpp");
-    ASSERT_EQ(components.ref, "HEAD");
-    ASSERT_FALSE(components.commit_hash.empty());
-    ASSERT_FALSE(components.blob_hash.empty());
+    REQUIRE(components.file_ext == ".cpp");
+    REQUIRE(components.file_path == "src/main.cpp");
+    REQUIRE(components.ref == "HEAD");
+    REQUIRE_FALSE(components.commit_hash.empty());
+    REQUIRE_FALSE(components.blob_hash.empty());
+}
+```
+
+**Critical URI Processing Notes:**
+
+1. **GitPath Integration Strategy:**
+```cpp
+// DON'T replace existing ParseGitUriComponents - enhance it
+GitUriComponents ParseAndResolveGitUri(const string &git_uri) {
+    GitUriComponents result;
+    result.git_uri = git_uri;
+    
+    // Use existing GitPath parsing
+    auto git_path = GitPath::Parse(git_uri);
+    result.repo_path = git_path.repository_path;
+    result.file_path = git_path.file_path;
+    result.ref = git_path.revision;
+    
+    // Add new functionality: hash resolution
+    auto hashes = ResolveFileHashes(git_path.repository_path, git_path.revision, git_path.file_path);
+    result.commit_hash = hashes.commit_hash;
+    result.tree_hash = hashes.tree_hash;
+    result.blob_hash = hashes.blob_hash;
+    
+    // Add new functionality: file extension
+    result.file_ext = ExtractFileExtension(git_path.file_path);
+    
+    return result;
 }
 ```
 
@@ -386,16 +433,18 @@ TEST(GitUtils, ParseAndResolveGitUri) {
 3. `DetectEncoding()` - Encoding detection  
 4. `AnalyzeGitObject()` - Combined analysis
 
-**Testing strategy:**
+**Testing strategy (Catch2 format):**
 ```cpp
-TEST(GitUtils, AnalyzeGitObject) {
+TEST_CASE("Analyze git object content", "[git_utils]") {
     GitRepository repo(".");
+    REQUIRE(repo.is_valid());
+    
     auto hashes = ResolveFileHashes(repo, "HEAD", "README.md");
     auto props = AnalyzeGitObject(repo, hashes.blob_hash);
     
-    ASSERT_EQ(props.kind, "blob");
-    ASSERT_TRUE(props.is_text);  // README should be text
-    ASSERT_GT(props.size_bytes, 0);
+    REQUIRE(props.kind == "blob");
+    REQUIRE(props.is_text);  // README should be text
+    REQUIRE(props.size_bytes > 0);
 }
 ```
 
@@ -427,35 +476,35 @@ diff before.txt after.txt  # Should be empty
 
 ### Unit Test Coverage
 
-**Each utility function gets comprehensive tests:**
+**Each utility function gets comprehensive tests (Catch2 format):**
 ```cpp
 // Hash resolution tests
-TEST(GitUtils, ResolveCommitHash);
-TEST(GitUtils, GetTreeHashForCommit);
-TEST(GitUtils, GetBlobHashForFile);
-TEST(GitUtils, ResolveFileHashes);
+TEST_CASE("Resolve commit hash", "[git_utils][hash]") { ... }
+TEST_CASE("Get tree hash for commit", "[git_utils][hash]") { ... }
+TEST_CASE("Get blob hash for file", "[git_utils][hash]") { ... }  
+TEST_CASE("Resolve file hashes", "[git_utils][hash]") { ... }
 
-// URI processing tests  
-TEST(GitUtils, ConstructGitUri);
-TEST(GitUtils, ExtractFileExtension);
-TEST(GitUtils, ParseGitUriComponents);
-TEST(GitUtils, ParseAndResolveGitUri);
+// URI processing tests
+TEST_CASE("Construct git URI", "[git_utils][uri]") { ... }
+TEST_CASE("Extract file extension", "[git_utils][uri]") { ... }
+TEST_CASE("Parse git URI components", "[git_utils][uri]") { ... }
+TEST_CASE("Parse and resolve git URI", "[git_utils][uri]") { ... }
 
-// Content analysis tests
-TEST(GitUtils, GetObjectKind);
-TEST(GitUtils, IsTextContent);
-TEST(GitUtils, DetectEncoding);
-TEST(GitUtils, AnalyzeGitObject);
+// Content analysis tests  
+TEST_CASE("Get object kind", "[git_utils][content]") { ... }
+TEST_CASE("Is text content", "[git_utils][content]") { ... }
+TEST_CASE("Detect encoding", "[git_utils][content]") { ... }
+TEST_CASE("Analyze git object", "[git_utils][content]") { ... }
 
 // RAII tests
-TEST(GitUtils, GitRepositoryRAII);
-TEST(GitUtils, GitCommitRAII);
-TEST(GitUtils, GitTreeRAII);
+TEST_CASE("GitRepository RAII", "[git_utils][raii]") { ... }
+TEST_CASE("GitCommit RAII", "[git_utils][raii]") { ... }
+TEST_CASE("GitTree RAII", "[git_utils][raii]") { ... }
 
 // Error handling tests
-TEST(GitUtils, InvalidRepository);
-TEST(GitUtils, InvalidRef);
-TEST(GitUtils, InvalidUri);
+TEST_CASE("Invalid repository", "[git_utils][error]") { ... }
+TEST_CASE("Invalid ref", "[git_utils][error]") { ... }
+TEST_CASE("Invalid URI", "[git_utils][error]") { ... }
 ```
 
 ### Integration Testing
@@ -524,6 +573,28 @@ time ./build/release/duckdb -c "SELECT COUNT(*) FROM git_log('HEAD') WHERE rowid
 - **Graceful degradation** for invalid inputs
 - **Resource leak prevention** with RAII
 
+### Critical Risk Areas Added:
+
+1. **GitPath Integration Conflicts**
+   - Risk: Breaking existing URI parsing logic
+   - Mitigation: Integrate with GitPath::Parse, don't replace it
+
+2. **Thread Safety Assumptions**
+   - Risk: libgit2 operations aren't thread-safe by default
+   - Mitigation: Check git_threads_init status, document thread requirements
+
+3. **Constructor Error Handling**
+   - Risk: RAII constructors can't return error codes
+   - Mitigation: Use explicit validation pattern, not throwing constructors
+
+4. **Move Semantics with git2 Objects**
+   - Risk: libgit2 objects may have internal callbacks/state
+   - Mitigation: Use simple pointer transfer, document non-copyable semantics
+
+5. **Existing Function Signature Changes**
+   - Risk: Subtle behavior changes in refactored functions
+   - Mitigation: Byte-for-byte output validation before/after refactor
+
 ## Success Criteria
 
 1. ✅ **All existing functions produce identical output** after refactoring
@@ -534,28 +605,31 @@ time ./build/release/duckdb -c "SELECT COUNT(*) FROM git_log('HEAD') WHERE rowid
 6. ✅ **Build system updated** to include git_utils module
 7. ✅ **Documentation updated** with new utility functions
 
-## Timeline
+## Final Decision: Refactoring Path Cancelled
 
-- **Phase 0.1 (Module Structure):** 30 minutes
-- **Phase 0.2 (RAII Wrappers):** 1 hour  
-- **Phase 0.3 (Hash Resolution):** 1.5 hours
-- **Phase 0.4 (URI Processing):** 1 hour
-- **Phase 0.5 (Content Analysis):** 1 hour
-- **Phase 0.6 (Refactor Functions):** 1.5 hours
+**Selected Option:** Skip refactoring entirely and proceed to URI schema work.
 
-**Total: ~6.5 hours** (can be parallelized to ~4 hours with careful coordination)
+**Time Saved:** 2.5-4.5 hours of complex refactoring work  
+**Approach:** Direct implementation using `uri-clarity.md` (6-8 hours) with safety measures from `refactoring-danger-zones.md`
 
-## Integration with URI Clarity Plan
+**Key Insight:** URI consistency can be achieved without complex refactoring. The danger zones document provides adequate ghost bug prevention.
 
-Once this refactoring is complete, the URI schema standardization work becomes:
+## Relationship to URI Clarity Plan
 
-1. **Update schemas** to use pre-tested utilities
-2. **Add new columns** by calling existing hash resolution functions  
-3. **Reorder columns** to match standard - no complex implementation needed
-4. **Test schema changes** - utilities already validated
+**FINAL DECISION:** No refactoring - proceed directly to URI schema work.
 
-The complex git operations are handled by tested utilities, making the schema work low-risk column manipulation.
+**Implementation Path:** Use `uri-clarity.md` with the following safety measures:
+- **`refactoring-danger-zones.md`** prevents ghost bugs during URI schema changes
+- **Inline utilities** added as needed during schema work
+- **Existing patterns preserved** (use `oid_to_hex()`, `ConstructGitUri()`, etc.)
 
 ---
 
-*This refactoring creates a solid foundation for all future git operations while significantly improving code quality, testability, and maintainability of the Duck Tails extension.*
+## Document Status: Reference Only
+
+**This document is retained for reference but should NOT be implemented.**
+
+**Active Implementation Document:** `uri-clarity.md`  
+**Safety Guide:** `refactoring-danger-zones.md`
+
+*The refactoring path was fully analyzed and determined to be unnecessary for achieving URI consistency goals.*

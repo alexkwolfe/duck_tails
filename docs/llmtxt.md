@@ -24,7 +24,7 @@ Examples:
 - `git://../other_repo@36581c4` - navigate to sibling repository
 - `git://../../parent/other_repo@HEAD` - navigate up and access different repo
 
-Functions that work with files return `git_file_uri` columns that can be:
+Functions that work with files return `git_uri` columns that can be:
 - Passed to other `_each` functions for chaining
 - Used with DuckDB readers: `read_csv()`, `read_json_auto()`, `read_parquet()`
 
@@ -70,7 +70,7 @@ Functions accept either git URIs or filesystem paths that are automatically reso
 Every function has an `_each` variant designed for LATERAL joins with column references.
 These support two main usage patterns:
 
-1. **URI Chaining**: Pass `git_file_uri` or `uri` columns from other git functions
+1. **URI Chaining**: Pass `git_uri` or `uri` columns from other git functions
 2. **Component Assembly**: Pass separate repo_path, file_path, and commit_sha from your datasets
 
 Both approaches enable powerful data analysis across git repositories.
@@ -309,14 +309,15 @@ git_read(file_path VARCHAR, ref VARCHAR) → TABLE
 ```
 
 Returns:
-- path VARCHAR: File path
-- blob_hash VARCHAR: Git blob hash
-- size_bytes BIGINT: File size
-- content BLOB: Raw file content
-- text VARCHAR: Text content (if UTF-8 compatible)
-- repo_path VARCHAR: Absolute path to repository
-- revision VARCHAR: Resolved revision
-- git_file_uri VARCHAR: URI to this file
+- uri VARCHAR: URI to this file
+- mode INTEGER: File mode (permissions)
+- kind VARCHAR: Object kind (blob/tree/etc)
+- is_text BOOLEAN: Whether content is text
+- encoding VARCHAR: Text encoding
+- size_bytes BIGINT: File size in bytes
+- truncated BOOLEAN: Whether content was truncated
+- text VARCHAR: Text content (if text file)
+- blob BLOB: Raw file content
 
 Examples:
 ```sql
@@ -426,7 +427,7 @@ WITH commits AS (
   FROM git_log('/repo')
 )
 SELECT * FROM commits c
-CROSS JOIN LATERAL git_parents_each(c.git_uri) p;
+CROSS JOIN LATERAL git_parents_each(c.uri) p;
 ```
 
 ### git_uri
@@ -451,7 +452,7 @@ SELECT git_uri('/path/to/repo', 'src/main.cpp', 'HEAD');
 ### LATERAL Join Usage Scenarios
 
 #### Scenario 1: URI Chaining from git functions
-Use `git_file_uri` or `uri` columns from git functions to chain operations:
+Use `git_uri` or `uri` columns from git functions to chain operations:
 
 ```sql
 -- Read files discovered by git_tree
@@ -515,7 +516,7 @@ GROUP BY t.path;
 
 -- Chain multiple functions using URIs
 WITH tree_files AS (
-  SELECT path, git_file_uri 
+  SELECT path, git_uri 
   FROM git_tree('/repo', 'HEAD')
 ),
 file_commits AS (
@@ -588,7 +589,7 @@ ORDER BY file_count DESC;
 ```sql
 -- Analyze CSV files in repository
 WITH csv_files AS (
-  SELECT git_file_uri, path
+  SELECT git_uri, path
   FROM git_tree('.', 'HEAD')
   WHERE path LIKE 'data/%.csv'
 )
@@ -617,7 +618,7 @@ WHERE v1.blob_hash != v2.blob_hash;
 
 ## Integration with DuckDB Readers
 
-The git_file_uri output can be passed to DuckDB's built-in readers:
+The git_uri output can be passed to DuckDB's built-in readers:
 
 ```sql
 -- Read CSV from git using git URIs

@@ -165,5 +165,16 @@ SELECT * FROM git_tree('git://.@v1.0.0');
 - All URI construction should use `git_uri()` function for consistency
 - Repository discovery happens at parse time via `GitPath::Parse`
 - URIs are normalized to absolute repository paths internally
-- The `git_file_uri` column in git functions provides ready-to-use URIs
+- The `git_uri` column in git functions provides ready-to-use URIs
 - Functions validate that git:// URIs don't conflict with revision parameters
+
+## Schema Standardization
+
+**⚠️ Breaking Changes Coming:** Duck Tails functions are being standardized for consistent URI schemas. See `uri-clarity.md` for details.
+
+**Key changes:**
+- All URI-returning functions will have consistent first 8 columns
+- Column names standardized: `git_uri` as first column for all functions
+- Enhanced metadata and cross-function compatibility
+
+**Migration guide** and timeline available in the URI clarity plan.

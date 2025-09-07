@@ -155,16 +155,21 @@ struct GitTreeFunctionData : public TableFunctionData {
 };
 
 struct GitTreeRow {
-    string commit_hash;   // Added for multi-commit support
-    timestamp_t commit_date; // Added context
-    string path;
-    int32_t mode;
-    string blob_hash;
-    int64_t size;
-    string git_file_uri;  // Ready-to-use git:// URI for this file
-    string file_path;     // Extracted file path from git_file_uri
-    string file_ext;      // File extension (e.g., .js, .cpp, .md)
-    string ref;          // Extracted ref from git_file_uri
+    string git_uri;           // Renamed from git_file_uri - complete git:// URI
+    string repo_path;         // NEW - repository filesystem path
+    string commit_hash;       // Git commit hash
+    string tree_hash;         // NEW - Git tree hash containing the file
+    string file_path;         // File path within repository (extracted from URI)
+    string file_ext;          // File extension (e.g., .js, .cpp, .md)
+    string ref;              // Git reference (SHA/branch/tag)
+    string blob_hash;         // Git blob hash of file content
+    timestamp_t commit_date;  // Commit timestamp
+    int32_t mode;            // File mode
+    int64_t size_bytes;      // Renamed from size - file size in bytes
+    string kind;             // NEW - object kind (blob, tree, etc.)
+    bool is_text;            // NEW - whether content is text
+    string encoding;         // NEW - text encoding (utf8, binary)
+    // REMOVED: string path; // Redundant with file_path
 };
 
 // Local state for git_tree_each LATERAL processing
