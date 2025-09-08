@@ -99,7 +99,7 @@ SELECT
 FROM repos r
 CROSS JOIN LATERAL git_branches_each(r.repo_uri) b;
 ----
-2	1
+13	1
 
 # Test 5: git_tags_each can consume git:// URIs
 # ==============================================

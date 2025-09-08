@@ -136,21 +136,21 @@ static void DefineGitParentsSchema(vector<LogicalType> &return_types, vector<str
 // Output helper for git_tree rows (repo_path is REQUIRED)
 static void OutputGitTreeRow(DataChunk &output, idx_t row_idx, 
                              const GitTreeRow &row, const string &repo_path) {
-    idx_t col = 0;
-    output.SetValue(col++, row_idx, Value(row.git_uri));                 // git_uri
-    output.SetValue(col++, row_idx, Value(repo_path));                   // repo_path
-    output.SetValue(col++, row_idx, Value(row.commit_hash));             // commit_hash
-    output.SetValue(col++, row_idx, Value(row.tree_hash));               // tree_hash
-    output.SetValue(col++, row_idx, Value(row.file_path));               // file_path
-    output.SetValue(col++, row_idx, Value(row.file_ext));                // file_ext
-    output.SetValue(col++, row_idx, Value(row.ref));                     // ref
-    output.SetValue(col++, row_idx, Value(row.blob_hash));               // blob_hash
-    output.SetValue(col++, row_idx, Value::TIMESTAMP(row.commit_date));  // commit_date
-    output.SetValue(col++, row_idx, Value::INTEGER(row.mode));           // mode
-    output.SetValue(col++, row_idx, Value::BIGINT(row.size_bytes));      // size_bytes
-    output.SetValue(col++, row_idx, Value(row.kind));                    // kind
-    output.SetValue(col++, row_idx, Value::BOOLEAN(row.is_text));        // is_text
-    output.SetValue(col++, row_idx, Value(row.encoding));                // encoding
+    // Use StringVector::AddString for proper string lifecycle management (like pre-refactor version)
+    FlatVector::GetData<string_t>(output.data[0])[row_idx] = StringVector::AddString(output.data[0], row.git_uri);
+    FlatVector::GetData<string_t>(output.data[1])[row_idx] = StringVector::AddString(output.data[1], repo_path);
+    FlatVector::GetData<string_t>(output.data[2])[row_idx] = StringVector::AddString(output.data[2], row.commit_hash);
+    FlatVector::GetData<string_t>(output.data[3])[row_idx] = StringVector::AddString(output.data[3], row.tree_hash);
+    FlatVector::GetData<string_t>(output.data[4])[row_idx] = StringVector::AddString(output.data[4], row.file_path);
+    FlatVector::GetData<string_t>(output.data[5])[row_idx] = StringVector::AddString(output.data[5], row.file_ext);
+    FlatVector::GetData<string_t>(output.data[6])[row_idx] = StringVector::AddString(output.data[6], row.ref);
+    FlatVector::GetData<string_t>(output.data[7])[row_idx] = StringVector::AddString(output.data[7], row.blob_hash);
+    FlatVector::GetData<timestamp_t>(output.data[8])[row_idx] = row.commit_date;
+    FlatVector::GetData<int32_t>(output.data[9])[row_idx] = row.mode;
+    FlatVector::GetData<int64_t>(output.data[10])[row_idx] = row.size_bytes;
+    FlatVector::GetData<string_t>(output.data[11])[row_idx] = StringVector::AddString(output.data[11], row.kind);
+    FlatVector::GetData<bool>(output.data[12])[row_idx] = row.is_text;
+    FlatVector::GetData<string_t>(output.data[13])[row_idx] = StringVector::AddString(output.data[13], row.encoding);
 }
 
 // Output helper for git_parents rows (repo_path is REQUIRED)
@@ -663,33 +663,36 @@ static void traverse_tree(git_repository *repo, git_tree *tree, const string &ba
                 git_blob_free(blob);
             }
             
-            // Build git:// URI and extract components
+            // Build git:// URI and extract components - ensure proper string copies
             string git_uri = BuildGitFileUri(repo_path, path, commit_hash);
             string file_ext = ExtractFileExtension(path);
             
             // Extract URI components (file_path and ref should match path and commit_hash)
-            string extracted_file_path = path;
-            string ref = commit_hash;  // For now use commit hash as ref
+            string extracted_file_path = string(path);  // Explicit copy
+            string ref = string(commit_hash);  // Explicit copy
             
             // Compute tree hash - get the tree containing this blob
             string tree_hash = oid_to_hex(git_tree_id(tree));
+            string blob_hash = oid_to_hex(oid);  // Store in variable to avoid temp object
             
-            out.push_back(GitTreeRow{
-                git_uri,           // git_uri
-                repo_path,         // repo_path  
-                commit_hash,       // commit_hash
-                tree_hash,         // tree_hash (will need proper computation)
-                extracted_file_path, // file_path
-                file_ext,          // file_ext
-                ref,               // ref
-                oid_to_hex(oid),   // blob_hash
-                commit_date,       // commit_date
-                mode,              // mode
-                size_bytes,        // size_bytes
-                kind,              // kind
-                is_text,           // is_text
-                encoding           // encoding
-            });
+            // Create the row with explicit string copies to ensure memory safety
+            GitTreeRow row;
+            row.git_uri = std::move(git_uri);
+            row.repo_path = string(repo_path);
+            row.commit_hash = string(commit_hash);
+            row.tree_hash = std::move(tree_hash);
+            row.file_path = std::move(extracted_file_path);
+            row.file_ext = std::move(file_ext);
+            row.ref = std::move(ref);
+            row.blob_hash = std::move(blob_hash);
+            row.commit_date = commit_date;
+            row.mode = mode;
+            row.size_bytes = size_bytes;
+            row.kind = string(kind);  // Explicit copy
+            row.is_text = is_text;
+            row.encoding = string(encoding);  // Explicit copy
+            
+            out.push_back(std::move(row));
         } else if (type == GIT_OBJECT_TREE) {
             git_tree *subtree = nullptr;
             if (git_tree_lookup(&subtree, repo, oid) == 0) {
@@ -1065,13 +1068,7 @@ static OperatorResultType GitTreeInOutFunction(ExecutionContext &context, TableF
         
         for (idx_t i = 0; i < count; i++) {
             auto &row = state.current_rows[state.current_output_row + i];
-            output.SetValue(0, i, Value(row.commit_hash));           // commit_hash
-            output.SetValue(1, i, Value::TIMESTAMP(row.commit_date)); // commit_date
-            output.SetValue(2, i, Value(row.file_path));             // file_path
-            output.SetValue(3, i, Value::INTEGER(row.mode));         // mode
-            output.SetValue(4, i, Value(row.blob_hash));             // blob_hash
-            output.SetValue(5, i, Value::BIGINT(row.size_bytes));    // size_bytes
-            output.SetValue(6, i, Value(row.git_uri));               // git_uri
+            OutputGitTreeRow(output, i, row, state.repo_path);
         }
         
         output.SetCardinality(count);
@@ -2071,14 +2068,7 @@ static OperatorResultType GitTreeEachFunction(ExecutionContext &context, TableFu
         
         for (idx_t i = 0; i < count; i++) {
             auto &row = state.current_rows[state.current_output_row + i];
-            output.SetValue(0, i, Value(resolved_repo_path));       // repo_path
-            output.SetValue(1, i, Value(row.commit_hash));           // commit_hash
-            output.SetValue(2, i, Value::TIMESTAMP(row.commit_date)); // commit_date
-            output.SetValue(3, i, Value(row.file_path));             // file_path
-            output.SetValue(4, i, Value::INTEGER(row.mode));         // mode
-            output.SetValue(5, i, Value(row.blob_hash));             // blob_hash
-            output.SetValue(6, i, Value::BIGINT(row.size_bytes));    // size_bytes
-            output.SetValue(7, i, Value(row.git_uri));               // git_uri
+            OutputGitTreeRow(output, i, row, resolved_repo_path);
         }
         
         output.SetCardinality(count);

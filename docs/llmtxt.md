@@ -58,8 +58,8 @@ Functions accept either git URIs or filesystem paths that are automatically reso
 - Duck Tails discovers the repository by walking up the directory tree from the given path
 - The repository root becomes `repo_path`, any additional path becomes `file_path`
 - Examples:
-  - `/home/user/repo/src/main.cpp` → repo: `/home/user/repo`, file: `src/main.cpp`
-  - `./` → repo: `./`, file: `` (empty = repository root)
+    - `/home/user/repo/src/main.cpp` → repo: `/home/user/repo`, file: `src/main.cpp`
+    - `./` → repo: `./`, file: `` (empty = repository root)
 
 **Two Parameters**: `(repo_or_file_path, ref)` where ref defaults to 'HEAD'
 - Supports range syntax: `main..feature` (two-dot) or `main...feature` (three-dot)
