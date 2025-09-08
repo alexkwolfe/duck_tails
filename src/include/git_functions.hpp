@@ -237,7 +237,8 @@ unique_ptr<FunctionData> GitParentsBind(ClientContext &context, TableFunctionBin
                                        vector<LogicalType> &return_types, vector<string> &names);
 unique_ptr<GlobalTableFunctionState> GitParentsInitGlobal(ClientContext &context, TableFunctionInitInput &input);
 
-// Forward declarations from git_clone.hpp
+// Forward declarations from git_clone.hpp - temporarily disabled
+/*
 struct GitCloneFunctionData;
 struct GitCloneLocalState;
 void GitCloneFunction(ClientContext &context, TableFunctionInput &data_p, DataChunk &output);
@@ -250,6 +251,7 @@ unique_ptr<FunctionData> GitCloneEachBind(ClientContext &context, TableFunctionB
 unique_ptr<GlobalTableFunctionState> GitCloneInitGlobal(ClientContext &context, TableFunctionInitInput &input);
 unique_ptr<LocalTableFunctionState> GitCloneLocalInit(ExecutionContext &context, TableFunctionInitInput &input, 
                                                      GlobalTableFunctionState *global_state);
+*/
 
 // Registration functions
 void RegisterGitLogFunction(DatabaseInstance &db);
@@ -257,7 +259,7 @@ void RegisterGitBranchesFunction(DatabaseInstance &db);
 void RegisterGitTagsFunction(DatabaseInstance &db);
 void RegisterGitTreeFunction(DatabaseInstance &db);
 void RegisterGitParentsFunction(DatabaseInstance &db);
-void RegisterGitCloneFunction(DatabaseInstance &db);
+// void RegisterGitCloneFunction(DatabaseInstance &db); // Temporarily disabled
 void RegisterGitFunctions(DatabaseInstance &db);
 
 } // namespace duckdb

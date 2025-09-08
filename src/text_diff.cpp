@@ -175,23 +175,46 @@ static void TextDiffFunction(DataChunk &args, ExpressionState &state, Vector &re
     auto &old_vector = args.data[0];
     auto &new_vector = args.data[1];
     
-    result.SetVectorType(VectorType::FLAT_VECTOR);
-    auto result_data = FlatVector::GetData<string_t>(result);
-    auto &result_validity = FlatVector::Validity(result);
+    // Check if all inputs are constants to determine result vector type
+    bool all_constant = old_vector.GetVectorType() == VectorType::CONSTANT_VECTOR && 
+                       new_vector.GetVectorType() == VectorType::CONSTANT_VECTOR;
     
-    for (idx_t i = 0; i < args.size(); i++) {
-        if (old_vector.GetValue(i).IsNull() || new_vector.GetValue(i).IsNull()) {
-            result_validity.SetInvalid(i);
-            continue;
+    if (all_constant) {
+        result.SetVectorType(VectorType::CONSTANT_VECTOR);
+        
+        // Handle constant case
+        if (ConstantVector::IsNull(old_vector) || ConstantVector::IsNull(new_vector)) {
+            ConstantVector::SetNull(result, true);
+            return;
         }
         
-        string old_text = old_vector.GetValue(i).ToString();
-        string new_text = new_vector.GetValue(i).ToString();
+        string old_text = ConstantVector::GetData<string_t>(old_vector)[0].GetString();
+        string new_text = ConstantVector::GetData<string_t>(new_vector)[0].GetString();
         
         auto diff = TextDiff::CreateDiff(old_text, new_text);
         string diff_str = diff.ToString();
         
-        result_data[i] = StringVector::AddString(result, diff_str);
+        auto result_data = ConstantVector::GetData<string_t>(result);
+        result_data[0] = StringVector::AddString(result, diff_str);
+    } else {
+        result.SetVectorType(VectorType::FLAT_VECTOR);
+        auto result_data = FlatVector::GetData<string_t>(result);
+        auto &result_validity = FlatVector::Validity(result);
+        
+        for (idx_t i = 0; i < args.size(); i++) {
+            if (old_vector.GetValue(i).IsNull() || new_vector.GetValue(i).IsNull()) {
+                result_validity.SetInvalid(i);
+                continue;
+            }
+            
+            string old_text = old_vector.GetValue(i).ToString();
+            string new_text = new_vector.GetValue(i).ToString();
+            
+            auto diff = TextDiff::CreateDiff(old_text, new_text);
+            string diff_str = diff.ToString();
+            
+            result_data[i] = StringVector::AddString(result, diff_str);
+        }
     }
 }
 
@@ -200,35 +223,64 @@ static void DiffTextFunction(DataChunk &args, ExpressionState &state, Vector &re
     auto &old_vector = args.data[0];
     auto &new_vector = args.data[1];
     
-    result.SetVectorType(VectorType::FLAT_VECTOR);
-    auto result_data = FlatVector::GetData<string_t>(result);
-    auto &result_validity = FlatVector::Validity(result);
+    // Check if all inputs are constants to determine result vector type
+    bool all_constant = old_vector.GetVectorType() == VectorType::CONSTANT_VECTOR && 
+                       new_vector.GetVectorType() == VectorType::CONSTANT_VECTOR;
     
-    for (idx_t i = 0; i < args.size(); i++) {
-        if (old_vector.GetValue(i).IsNull() || new_vector.GetValue(i).IsNull()) {
-            result_validity.SetInvalid(i);
-            continue;
+    if (all_constant) {
+        result.SetVectorType(VectorType::CONSTANT_VECTOR);
+        
+        // Handle constant case
+        if (ConstantVector::IsNull(old_vector) || ConstantVector::IsNull(new_vector)) {
+            ConstantVector::SetNull(result, true);
+            return;
         }
         
-        string old_text = old_vector.GetValue(i).ToString();
-        string new_text = new_vector.GetValue(i).ToString();
+        string old_text = ConstantVector::GetData<string_t>(old_vector)[0].GetString();
+        string new_text = ConstantVector::GetData<string_t>(new_vector)[0].GetString();
         
         try {
-            // Pure text diffing - no file I/O
             auto diff = TextDiff::CreateDiff(old_text, new_text);
             
             if (diff.IsEmpty()) {
-                // Return NULL for identical content
-                result_validity.SetInvalid(i);
+                ConstantVector::SetNull(result, true);
             } else {
                 string diff_str = diff.ToString();
-                result_data[i] = StringVector::AddString(result, diff_str);
+                auto result_data = ConstantVector::GetData<string_t>(result);
+                result_data[0] = StringVector::AddString(result, diff_str);
+            }
+        } catch (const std::exception &e) {
+            string error_str = "Error: " + string(e.what());
+            auto result_data = ConstantVector::GetData<string_t>(result);
+            result_data[0] = StringVector::AddString(result, error_str);
+        }
+    } else {
+        result.SetVectorType(VectorType::FLAT_VECTOR);
+        auto result_data = FlatVector::GetData<string_t>(result);
+        auto &result_validity = FlatVector::Validity(result);
+        
+        for (idx_t i = 0; i < args.size(); i++) {
+            if (old_vector.GetValue(i).IsNull() || new_vector.GetValue(i).IsNull()) {
+                result_validity.SetInvalid(i);
+                continue;
             }
             
-        } catch (const std::exception &e) {
-            // Return error as string for now - full implementation would throw proper exceptions
-            string error_str = "Error: " + string(e.what());
-            result_data[i] = StringVector::AddString(result, error_str);
+            string old_text = old_vector.GetValue(i).ToString();
+            string new_text = new_vector.GetValue(i).ToString();
+            
+            try {
+                auto diff = TextDiff::CreateDiff(old_text, new_text);
+                
+                if (diff.IsEmpty()) {
+                    result_validity.SetInvalid(i);
+                } else {
+                    string diff_str = diff.ToString();
+                    result_data[i] = StringVector::AddString(result, diff_str);
+                }
+            } catch (const std::exception &e) {
+                string error_str = "Error: " + string(e.what());
+                result_data[i] = StringVector::AddString(result, error_str);
+            }
         }
     }
 }

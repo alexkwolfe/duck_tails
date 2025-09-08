@@ -633,7 +633,26 @@ static void traverse_tree(git_repository *repo, git_tree *tree, const string &ba
         if (type == GIT_OBJECT_BLOB) {
             git_blob *blob = nullptr;
             int64_t size_bytes = 0;
-            string kind = "blob";
+            // Determine object type based on filemode (consistent with git_read)
+            string kind;
+            switch (mode) {
+                case GIT_FILEMODE_BLOB:
+                case GIT_FILEMODE_BLOB_EXECUTABLE:
+                    kind = "file";
+                    break;
+                case GIT_FILEMODE_LINK:
+                    kind = "symlink";
+                    break;
+                case GIT_FILEMODE_TREE:
+                    kind = "tree";
+                    break;
+                case GIT_FILEMODE_COMMIT:
+                    kind = "submodule";
+                    break;
+                default:
+                    kind = "unknown";
+                    break;
+            }
             bool is_text = false;
             string encoding = "unknown";
             
@@ -653,10 +672,7 @@ static void traverse_tree(git_repository *repo, git_tree *tree, const string &ba
             string ref = commit_hash;  // For now use commit hash as ref
             
             // Compute tree hash - get the tree containing this blob
-            string tree_hash = "";
-            // For now, we'll need to compute this from the tree we're traversing
-            // This is a simplified approach - in a complete implementation,
-            // we'd track the tree hash as we traverse
+            string tree_hash = oid_to_hex(git_tree_id(tree));
             
             out.push_back(GitTreeRow{
                 git_uri,           // git_uri
@@ -1051,11 +1067,11 @@ static OperatorResultType GitTreeInOutFunction(ExecutionContext &context, TableF
             auto &row = state.current_rows[state.current_output_row + i];
             output.SetValue(0, i, Value(row.commit_hash));           // commit_hash
             output.SetValue(1, i, Value::TIMESTAMP(row.commit_date)); // commit_date
-            output.SetValue(2, i, Value(row.path));                  // path
+            output.SetValue(2, i, Value(row.file_path));             // file_path
             output.SetValue(3, i, Value::INTEGER(row.mode));         // mode
             output.SetValue(4, i, Value(row.blob_hash));             // blob_hash
-            output.SetValue(5, i, Value::BIGINT(row.size));          // size
-            output.SetValue(6, i, Value(row.git_file_uri));          // git_file_uri
+            output.SetValue(5, i, Value::BIGINT(row.size_bytes));    // size_bytes
+            output.SetValue(6, i, Value(row.git_uri));               // git_uri
         }
         
         output.SetCardinality(count);
@@ -2058,11 +2074,11 @@ static OperatorResultType GitTreeEachFunction(ExecutionContext &context, TableFu
             output.SetValue(0, i, Value(resolved_repo_path));       // repo_path
             output.SetValue(1, i, Value(row.commit_hash));           // commit_hash
             output.SetValue(2, i, Value::TIMESTAMP(row.commit_date)); // commit_date
-            output.SetValue(3, i, Value(row.path));                  // path
+            output.SetValue(3, i, Value(row.file_path));             // file_path
             output.SetValue(4, i, Value::INTEGER(row.mode));         // mode
             output.SetValue(5, i, Value(row.blob_hash));             // blob_hash
-            output.SetValue(6, i, Value::BIGINT(row.size));          // size
-            output.SetValue(7, i, Value(row.git_file_uri));          // git_file_uri
+            output.SetValue(6, i, Value::BIGINT(row.size_bytes));    // size_bytes
+            output.SetValue(7, i, Value(row.git_uri));               // git_uri
         }
         
         output.SetCardinality(count);
@@ -3056,7 +3072,7 @@ static OperatorResultType GitReadEachFunction(ExecutionContext &context, TableFu
             
             // Fill output columns
             FlatVector::GetData<string_t>(output.data[0])[output_count] = 
-                StringVector::AddString(output.data[0], result.uri);
+                StringVector::AddString(output.data[0], result.git_uri);
             FlatVector::GetData<int32_t>(output.data[1])[output_count] = result.mode;
             FlatVector::GetData<string_t>(output.data[2])[output_count] = 
                 StringVector::AddString(output.data[2], result.kind);
@@ -3247,6 +3263,11 @@ static void RegisterGitUriFunction(DatabaseInstance &db) {
 }
 
 void RegisterGitCloneFunction(DatabaseInstance &db) {
+    // git_clone functionality temporarily disabled due to StringVector API issues
+    // See git-clone.md for details on the API mismatch problem
+    // TODO: Fix StringVector::AddString calls in git_clone.cpp and re-enable
+    
+    /*
     // git_clone(url) -> TABLE
     TableFunction git_clone_1("git_clone", {LogicalType::VARCHAR}, GitCloneFunction, GitCloneBind, GitCloneInitGlobal);
     git_clone_1.named_parameters["repo_path"] = LogicalType::VARCHAR;
@@ -3295,6 +3316,7 @@ void RegisterGitCloneFunction(DatabaseInstance &db) {
     git_clone_each_set.AddFunction(git_clone_each_full);
     
     ExtensionUtil::RegisterFunction(db, git_clone_each_set);
+    */
 }
 
 void RegisterGitFunctions(DatabaseInstance &db) {
@@ -3305,7 +3327,7 @@ void RegisterGitFunctions(DatabaseInstance &db) {
     RegisterGitParentsFunction(db);
     RegisterGitReadFunction(db);
     RegisterGitUriFunction(db);
-    RegisterGitCloneFunction(db);
+    // RegisterGitCloneFunction(db); // Temporarily disabled due to StringVector API issues
 }
 
 } // namespace duckdb
