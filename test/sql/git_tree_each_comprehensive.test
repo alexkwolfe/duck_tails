@@ -13,17 +13,17 @@ SELECT COUNT(*) > 0 as has_files FROM git_tree_each('test/tmp/main-repo', 'HEAD'
 ----
 true
 
-# Test git_tree_each schema consistency (should have 8 columns including repo_path and git_file_uri)
+# Test git_tree_each schema consistency (should have 14 columns with expanded schema)
 query I
 SELECT COUNT(*) FROM (
   DESCRIBE (SELECT * FROM git_tree_each('test/tmp/main-repo', 'HEAD'))
 )
 ----
-8
+14
 
 # Test git_tree_each return columns match expected schema
 statement ok
-SELECT commit_hash, commit_date, path, mode, blob_hash, size, git_file_uri
+SELECT commit_hash, commit_date, file_path, mode, blob_hash, size_bytes, git_uri
 FROM git_tree_each('test/tmp/main-repo', 'HEAD') LIMIT 1
 
 # Test LATERAL git_tree_each with single repository path
@@ -79,10 +79,10 @@ SELECT COUNT(*) > 0 as has_files FROM git_tree()
 ----
 true
 
-# Test git_file_uri column format
+# Test git_uri column format
 query T
-SELECT git_file_uri LIKE 'git://%/test/tmp/main-repo/README.md@%' as correct_format 
+SELECT git_uri LIKE 'git://%/test/tmp/main-repo/README.md@%' as correct_format 
 FROM git_tree_each('test/tmp/main-repo', 'HEAD') 
-WHERE path = 'README.md'
+WHERE file_path = 'README.md'
 ----
 true
