@@ -1,0 +1,9 @@
+# Sanity test
+statement ok
+LOAD duck_tails;
+
+# Simple query
+query I
+SELECT 1;
+----
+1

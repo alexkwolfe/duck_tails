@@ -1,0 +1,262 @@
+--- a/src/git_functions.cpp
++++ b/src/git_functions.cpp
+@@ -53,6 +53,35 @@
+     }
+     return true;
+ }
++// --- UVF helpers for reading VARCHAR inputs in *_each functions ---
++// Returns true and sets 'out' when column exists and value is non-NULL at 'row'.
++// Returns false if column is out-of-bounds or the specific row is NULL.
++static inline bool TryReadVarcharAtRow(const DataChunk &input, idx_t col, idx_t row, std::string &out) {
++    if (col >= input.ColumnCount()) {
++        return false;
++    }
++    UnifiedVectorFormat fmt;
++    input.data[col].ToUnifiedFormat(input.size(), fmt);
++    const auto *vals = UnifiedVectorFormat::GetData<string_t>(fmt);
++    const auto idx = fmt.sel->get_index(row);
++    if (!fmt.validity.RowIsValid(idx)) {
++        return false;
++    }
++    out = vals[idx].GetString();
++    return true;
++}
++
++// Same as TryReadVarcharAtRow, but throws if the value is missing.
++static inline std::string ReadRequiredVarcharAtRow(const DataChunk &input, idx_t col, idx_t row, const char *what) {
++    std::string out;
++    if (!TryReadVarcharAtRow(input, col, row, out)) {
++        throw BinderException(StringUtil::Format("%s: NULL or missing argument at column %llu (row %llu)",
++                                                 what ? what : "required argument",
++                                                 (unsigned long long)col, (unsigned long long)row));
++    }
++    return out;
++}
++
+ 
+ //===--------------------------------------------------------------------===//
+ // Unified Parameter Parsing Helper for New Signature Design
+@@ -1234,30 +1263,21 @@
+             }
+             
+             // LATERAL function: extract repo_path_or_uri from input DataChunk
+-            input.Flatten();
++            // input read via UnifiedVectorFormat (no Flatten needed);
+             
+             // Check if input has columns and data
+             if (input.ColumnCount() == 0) {
+                 throw BinderException("git_log_each: no input columns available");
+             }
+             
+-            // Check if the input is null
+-            if (FlatVector::IsNull(input.data[0], state.current_input_row)) {
+-                // Move to next input row if null
++            std::string source;
++            if (!TryReadVarcharAtRow(input, 0, state.current_input_row, source)) {
+                 state.current_input_row++;
+                 state.initialized_row = false;
+                 continue;
+             }
+             
+-            // Extract repo_path_or_uri from input DataChunk - direct string_t access
+-            auto data = FlatVector::GetData<string_t>(input.data[0]);
+-            if (!data) {
+-                throw BinderException("git_log_each: no string data in input column");
+-            }
+-            
+-            // Get the string_t directly and convert to string
+-            auto string_t_value = data[state.current_input_row];
+-            string repo_path_or_uri(string_t_value.GetData(), string_t_value.GetSize());
++            std::string repo_path_or_uri = source;
+             
+             if (repo_path_or_uri.empty()) {
+                 throw BinderException("git_log_each: received empty repo_path_or_uri from input");
+@@ -1449,30 +1469,21 @@
+             }
+             
+             // LATERAL function: extract repo_path_or_uri from input DataChunk
+-            input.Flatten();
++            // input read via UnifiedVectorFormat (no Flatten needed);
+             
+             // Check if input has columns and data
+             if (input.ColumnCount() == 0) {
+                 throw BinderException("git_branches_each: no input columns available");
+             }
+             
+-            // Check if the input is null
+-            if (FlatVector::IsNull(input.data[0], state.current_input_row)) {
+-                // Move to next input row if null
++            std::string repo_path_or_uri;
++            if (!TryReadVarcharAtRow(input, 0, state.current_input_row, repo_path_or_uri)) {
+                 state.current_input_row++;
+                 state.initialized_row = false;
+                 continue;
+             }
+             
+-            // Extract repo_path_or_uri from input DataChunk - direct string_t access
+-            auto data = FlatVector::GetData<string_t>(input.data[0]);
+-            if (!data) {
+-                throw BinderException("git_branches_each: no string data in input column");
+-            }
+-            
+-            // Get the string_t directly and convert to string
+-            auto string_t_value = data[state.current_input_row];
+-            string repo_path_or_uri(string_t_value.GetData(), string_t_value.GetSize());
++            /* UVF */ /* repo_path_or_uri already read */
+             
+             if (repo_path_or_uri.empty()) {
+                 throw BinderException("git_branches_each: received empty repo_path_or_uri from input");
+@@ -1662,30 +1673,21 @@
+             }
+             
+             // LATERAL function: extract repo_path_or_uri from input DataChunk
+-            input.Flatten();
++            // input read via UnifiedVectorFormat (no Flatten needed);
+             
+             // Check if input has columns and data
+             if (input.ColumnCount() == 0) {
+                 throw BinderException("git_tags_each: no input columns available");
+             }
+             
+-            // Check if the input is null
+-            if (FlatVector::IsNull(input.data[0], state.current_input_row)) {
+-                // Move to next input row if null
++            std::string repo_path_or_uri;
++            if (!TryReadVarcharAtRow(input, 0, state.current_input_row, repo_path_or_uri)) {
+                 state.current_input_row++;
+                 state.initialized_row = false;
+                 continue;
+             }
+             
+-            // Extract repo_path_or_uri from input DataChunk - direct string_t access
+-            auto data = FlatVector::GetData<string_t>(input.data[0]);
+-            if (!data) {
+-                throw BinderException("git_tags_each: no string data in input column");
+-            }
+-            
+-            // Get the string_t directly and convert to string
+-            auto string_t_value = data[state.current_input_row];
+-            string repo_path_or_uri(string_t_value.GetData(), string_t_value.GetSize());
++            /* UVF */ /* repo_path_or_uri already read */
+             
+             if (repo_path_or_uri.empty()) {
+                 throw BinderException("git_tags_each: received empty repo_path_or_uri from input");
+@@ -1887,42 +1889,32 @@
+             }
+             
+             // LATERAL function: extract repo_path_or_uri from input DataChunk
+-            input.Flatten();
++            // input read via UnifiedVectorFormat (no Flatten needed);
+             
+             // Check if input has columns and data
+             if (input.ColumnCount() == 0) {
+                 throw BinderException("git_tree_each: no input columns available");
+             }
+             
+-            // Check if the input is null
+-            if (FlatVector::IsNull(input.data[0], state.current_input_row)) {
+-                // Move to next input row if null
++            std::string first_param;
++            if (!TryReadVarcharAtRow(input, 0, state.current_input_row, first_param)) {
+                 state.current_input_row++;
+                 state.initialized_row = false;
+                 continue;
+             }
+             
+-            // Extract repo_path_or_uri from input DataChunk - direct string_t access
+-            auto data = FlatVector::GetData<string_t>(input.data[0]);
+-            if (!data) {
+-                throw BinderException("git_tree_each: no string data in input column");
+-            }
+-            
+-            // Get the string_t directly and convert to string
+-            auto string_t_value = data[state.current_input_row];
+-            string repo_path_or_uri(string_t_value.GetData(), string_t_value.GetSize());
++            std::string repo_path_or_uri = first_param;
+             
+             if (repo_path_or_uri.empty()) {
+                 throw BinderException("git_tree_each: received empty repo_path_or_uri from input");
+             }
+             
+-            // Get ref parameter - either from input columns or use default (current branch)
++                        // Get ref parameter - either from input columns or use default (current branch)
+             string final_ref = bind_data.ref; // Default from bind
+-            if (input.ColumnCount() > 1 && !FlatVector::IsNull(input.data[1], state.current_input_row)) {
+-                auto ref_data = FlatVector::GetData<string_t>(input.data[1]);
+-                if (ref_data) {
+-                    auto ref_string_t = ref_data[state.current_input_row];
+-                    final_ref = string(ref_string_t.GetData(), ref_string_t.GetSize());
++            {
++                std::string maybe_ref;
++                if (TryReadVarcharAtRow(input, 1, state.current_input_row, maybe_ref)) {
++                    final_ref = maybe_ref;
+                 }
+             }
+             
+@@ -2153,30 +2145,21 @@
+             }
+             
+             // LATERAL function: extract commit_hash from input DataChunk
+-            input.Flatten();
++            // input read via UnifiedVectorFormat (no Flatten needed);
+             
+             // Check if input has columns and data
+             if (input.ColumnCount() == 0) {
+                 throw BinderException("git_parents_each: no input columns available");
+             }
+             
+-            // Check if the input is null
+-            if (FlatVector::IsNull(input.data[0], state.current_input_row)) {
+-                // Move to next input row if null
++            std::string commit_ref_or_uri;
++            if (!TryReadVarcharAtRow(input, 0, state.current_input_row, commit_ref_or_uri)) {
+                 state.current_input_row++;
+                 state.initialized_row = false;
+                 continue;
+             }
+             
+-            // Extract commit_hash from input DataChunk
+-            auto data = FlatVector::GetData<string_t>(input.data[0]);
+-            if (!data) {
+-                throw BinderException("git_parents_each: no string data in input column");
+-            }
+-            
+-            // Get the string_t directly and convert to string
+-            auto string_t_value = data[state.current_input_row];
+-            string commit_ref_or_uri(string_t_value.GetData(), string_t_value.GetSize());
++            // commit_ref_or_uri already read via UVF above
+             
+             if (commit_ref_or_uri.empty()) {
+                 throw BinderException("git_parents_each: received empty commit reference from input");
+@@ -2200,22 +2183,17 @@
+                     }
+                     
+                     // Check if there's a repo_path override from the second parameter
+-                    if (input.ColumnCount() > 1 && !FlatVector::IsNull(input.data[1], state.current_input_row)) {
+-                        auto repo_data = FlatVector::GetData<string_t>(input.data[1]);
+-                        if (repo_data) {
+-                            auto repo_string_t = repo_data[state.current_input_row];
+-                            string explicit_repo_path(repo_string_t.GetData(), repo_string_t.GetSize());
+-                            if (!explicit_repo_path.empty()) {
+-                                // Resolve the explicit repo path
+-                                try {
+-                                    auto explicit_git_path = GitPath::Parse("git://" + explicit_repo_path + "@HEAD");
+-                                    repo_path_to_use = explicit_git_path.repository_path;
+-                                } catch (const std::exception &e) {
+-                                    // Keep using the URI-derived repo path
+-                                }
+-                            }
++                    {
++                    std::string explicit_repo_path;
++                    if (TryReadVarcharAtRow(input, 1, state.current_input_row, explicit_repo_path) && !explicit_repo_path.empty()) {
++                        try {
++                            auto explicit_git_path = GitPath::Parse("git://" + explicit_repo_path + "@HEAD");
++                            repo_path_to_use = explicit_git_path.repository_path;
++                        } catch (const std::exception &e) {
++                            // Keep using the URI-derived repo path
+                         }
+                     }
++                }
+                 } catch (const std::exception &e) {
+                     throw BinderException("git_parents_each: Failed to parse git:// URI '%s': %s", commit_ref_or_uri, e.what());
+                 }

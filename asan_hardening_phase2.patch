@@ -1,0 +1,383 @@
+*** PATCHSET: Duck Tails ASan hardening (phase-2) ***
+*** Applies to: src/git_functions.cpp (+ new tests) ***
+
+# ----------------------------------------------------
+# Patch 1: Make ALL `git_read_each` overloads LATERAL-only
+#          (remove main_function, keep in_out_function)
+# ----------------------------------------------------
+diff --git a/src/git_functions.cpp b/src/git_functions.cpp
+--- a/src/git_functions.cpp
++++ b/src/git_functions.cpp
+@@ -XXXX,12 +XXXX,12 @@
+- // git_read_each(repo_or_uri)
+- TableFunction git_read_each_1({LogicalType::VARCHAR},
+-     /*main_function*/ GitReadFunction,
+-     GitReadEachBind, GitReadInitGlobal, GitReadLocalInit);
++ // git_read_each(repo_or_uri) — LATERAL-only
++ TableFunction git_read_each_1({LogicalType::VARCHAR},
++     /*main_function*/ nullptr,
++     GitReadEachBind, GitReadInitGlobal, GitReadLocalInit);
+  git_read_each_1.in_out_function = GitReadEachFunction;
+  git_read_each_set.AddFunction(git_read_each_1);
+
+- // git_read_each(repo_or_uri, ref)
+- TableFunction git_read_each_2({LogicalType::VARCHAR, LogicalType::VARCHAR},
+-     GitReadFunction, GitReadEachBind, GitReadInitGlobal, GitReadLocalInit);
++ // git_read_each(repo_or_uri, ref) — LATERAL-only
++ TableFunction git_read_each_2({LogicalType::VARCHAR, LogicalType::VARCHAR},
++     /*main_function*/ nullptr, GitReadEachBind, GitReadInitGlobal, GitReadLocalInit);
+  git_read_each_2.in_out_function = GitReadEachFunction;
+  git_read_each_set.AddFunction(git_read_each_2);
+
+- // git_read_each(repo_or_uri, ref, max_bytes)
+- TableFunction git_read_each_3({LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BIGINT},
+-     GitReadFunction, GitReadEachBind, GitReadInitGlobal, GitReadLocalInit);
++ // git_read_each(repo_or_uri, ref, max_bytes) — LATERAL-only
++ TableFunction git_read_each_3({LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BIGINT},
++     /*main_function*/ nullptr, GitReadEachBind, GitReadInitGlobal, GitReadLocalInit);
+  git_read_each_3.in_out_function = GitReadEachFunction;
+  git_read_each_set.AddFunction(git_read_each_3);
+
+- // git_read_each(repo_or_uri, ref, max_bytes, transcode)
+- TableFunction git_read_each_4({LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::VARCHAR},
+-     GitReadFunction, GitReadEachBind, GitReadInitGlobal, GitReadLocalInit);
++ // git_read_each(repo_or_uri, ref, max_bytes, transcode) — LATERAL-only
++ TableFunction git_read_each_4({LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::VARCHAR},
++     /*main_function*/ nullptr, GitReadEachBind, GitReadInitGlobal, GitReadLocalInit);
+  git_read_each_4.in_out_function = GitReadEachFunction;
+  git_read_each_set.AddFunction(git_read_each_4);
+
+- // git_read_each(repo_or_uri, ref, max_bytes, transcode, encoding)
+- TableFunction git_read_each_5({LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::VARCHAR, LogicalType::VARCHAR},
+-     GitReadFunction, GitReadEachBind, GitReadInitGlobal, GitReadLocalInit);
++ // git_read_each(repo_or_uri, ref, max_bytes, transcode, encoding) — LATERAL-only
++ TableFunction git_read_each_5({LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::VARCHAR, LogicalType::VARCHAR},
++     /*main_function*/ nullptr, GitReadEachBind, GitReadInitGlobal, GitReadLocalInit);
+  git_read_each_5.in_out_function = GitReadEachFunction;
+  git_read_each_set.AddFunction(git_read_each_5);
+
+
+# ----------------------------------------------------
+# Patch 2: Binder — remove “direct call” path for *_each
+#          (never set bind_data.uri for LATERAL)
+# ----------------------------------------------------
+diff --git a/src/git_functions.cpp b/src/git_functions.cpp
+--- a/src/git_functions.cpp
++++ b/src/git_functions.cpp
+@@ -YYYY,34 +YYYY,18 @@ static unique_ptr<FunctionData>
+ GitReadEachBind(ClientContext &context,
+                 TableFunctionBindInput &input,
+                 vector<LogicalType> &return_types,
+                 vector<string> &names) {
+-    // Optional direct-call detection (REMOVE for LATERAL-only)
+-    string uri_for_direct_call = "";
+-    bool is_direct_call = false;
+-    if (!input.inputs.empty() && !input.inputs[0].IsNull()) {
+-        if (input.inputs[0].type().id() == LogicalTypeId::VARCHAR) {
+-            uri_for_direct_call = StringValue::Get(input.inputs[0]);
+-            is_direct_call = true;
+-        }
+-    }
+-
+-    // Compute parameter offset depending on direct mode
+-    int param_offset = is_direct_call ? 2 : 1;
++    // LATERAL-only: arguments arrive at runtime via input DataChunk
++    const string uri_for_direct_call = "";
++    const bool is_direct_call = false;
++    int param_offset = 1;
+
+     // parse named options (max_bytes, decode_base64, transcode, filters, …)
+     // and build the return schema (names/return_types) as today
+
+-    // Return bind data; DO NOT stash a direct URI for *_each
+-    return make_uniq<GitReadBindData>(max_bytes, decode_base64, transcode,
+-                                      filters, repo_path, uri_for_direct_call);
++    return make_uniq<GitReadBindData>(max_bytes, decode_base64, transcode,
++                                      filters, repo_path, /*uri=*/"");
+ }
+
+# ----------------------------------------------------
+# Patch 3: Executor — pure LATERAL path + safer BLOB writes
+# ----------------------------------------------------
+diff --git a/src/git_functions.cpp b/src/git_functions.cpp
+--- a/src/git_functions.cpp
++++ b/src/git_functions.cpp
+@@ -ZZZZ,120 +ZZZZ,158 @@
+ static OperatorResultType GitReadEachFunction(ExecutionContext &context,
+                                               TableFunctionInput &data_p,
+                                               DataChunk &input,
+                                               DataChunk &output) {
+     auto &bind = data_p.bind_data->Cast<GitReadBindData>();
+     auto &state = data_p.local_state->Cast<GitReadLocalState>();
+
+-    // Direct-call branch (REMOVE for LATERAL-only)
+-    if (!bind.uri.empty()) {
+-        // emit single row based on bind.uri ...
+-        // THIS BRANCH CAUSED SHAPE/CARDINALITY CONFUSION — delete entirely
+-    }
++    // LATERAL-only; inputs flow via 'input' data chunk
+
+-    input.Flatten();
++    // Defensive invariants (debug builds)
++    D_ASSERT(output.ColumnCount() == 16);
++    D_ASSERT(input.ColumnCount() >= 1);
+
+     while (true) {
+         if (!state.initialized_row) {
+-            if (state.current_input_row >= input.size()) {
++            if (state.current_input_row >= input.size()) {
+                 state.current_input_row = 0;
+                 state.initialized_row = false;
+                 return OperatorResultType::NEED_MORE_INPUT;
+             }
+-
+-            if (FlatVector::IsNull(input.data[0], state.current_input_row)) {
+-                state.current_input_row++;
+-                state.initialized_row = false;
+-                continue;
+-            }
+-
+-            // Read first arg (repo_or_uri) and optional second (ref) directly from FLAT vectors
+-            auto repo_data = FlatVector::GetData<string_t>(input.data[0]);
+-            auto repo_st = repo_data[state.current_input_row];
+-            string first_param(repo_st.GetData(), repo_st.GetSize());
+-            string explicit_ref = "";
+-            if (input.ColumnCount() > 1 && !FlatVector::IsNull(input.data[1], state.current_input_row)) {
+-                auto ref_data = FlatVector::GetData<string_t>(input.data[1]);
+-                auto ref_st = ref_data[state.current_input_row];
+-                explicit_ref.assign(ref_st.GetData(), ref_st.GetSize());
+-            }
++            // Read inputs via UnifiedVectorFormat (dictionary/constant safe)
++            UnifiedVectorFormat repo_fmt;
++            input.data[0].ToUnifiedFormat(input.size(), repo_fmt);
++            const auto *repo_vals = UnifiedVectorFormat::GetData<string_t>(repo_fmt);
++            const auto ridx = repo_fmt.sel->get_index(state.current_input_row);
++            if (!repo_fmt.validity.RowIsValid(ridx)) {
++                state.current_input_row++;
++                state.initialized_row = false;
++                continue; // NULL repo/URI row
++            }
++            const string first_param = repo_vals[ridx].GetString();
++
++            string explicit_ref;
++            if (input.ColumnCount() > 1) {
++                UnifiedVectorFormat ref_fmt;
++                input.data[1].ToUnifiedFormat(input.size(), ref_fmt);
++                const auto *ref_vals = UnifiedVectorFormat::GetData<string_t>(ref_fmt);
++                const auto r2idx = ref_fmt.sel->get_index(state.current_input_row);
++                if (ref_fmt.validity.RowIsValid(r2idx)) {
++                    explicit_ref = ref_vals[r2idx].GetString();
++                }
++            }
+
+             // Canonicalize URI
+             string uri;
+             if (StringUtil::StartsWith(first_param, "git://")) {
+                 uri = explicit_ref.empty() ? first_param : first_param + "@" + explicit_ref;
+             } else {
+                 const string &ref = explicit_ref.empty() ? string("HEAD") : explicit_ref;
+                 uri = "git://" + first_param + "@" + ref;
+             }
+
+             // Produce results for this input row
+             state.current_results.clear();
+             GitReadLocalState::ReadResult out;
+             ProcessGitURI(uri, bind, out);
+             state.current_results.push_back(out);
+
+             state.initialized_row = true;
+             state.current_output_row = 0;
+         }
+
+-        // Emit rows
++        // Emit rows (fill then set cardinality)
+         idx_t out_count = 0;
+         while (state.current_output_row < state.current_results.size() &&
+                out_count < STANDARD_VECTOR_SIZE) {
+             const auto &r = state.current_results[state.current_output_row];
+
+             // Scalars + TEXT via SetValue (manages validity)
+             output.SetValue(0,  out_count, Value(r.git_uri));
+             output.SetValue(1,  out_count, Value(r.repo_path));
+             output.SetValue(2,  out_count, Value(r.commit_hash));
+             output.SetValue(3,  out_count, Value(r.tree_hash));
+             output.SetValue(4,  out_count, Value(r.file_path));
+             output.SetValue(5,  out_count, Value(r.file_ext));
+             output.SetValue(6,  out_count, Value(r.ref));
+             output.SetValue(7,  out_count, Value(r.blob_hash));
+             output.SetValue(8,  out_count, Value::INTEGER(r.mode));
+             output.SetValue(9,  out_count, Value(r.kind));
+             output.SetValue(10, out_count, Value::BOOLEAN(r.is_text));
+             output.SetValue(11, out_count, Value(r.encoding));
+             output.SetValue(12, out_count, Value::BIGINT(r.size_bytes));
+             output.SetValue(13, out_count, Value::BOOLEAN(r.truncated));
+
+-            if (!r.text.empty()) {
+-                output.SetValue(14, out_count, Value(r.text));
+-            } else {
+-                FlatVector::SetNull(output.data[14], out_count, true);
+-            }
++            if (!r.text.empty()) { output.SetValue(14, out_count, Value(r.text)); }
++            else { FlatVector::SetNull(output.data[14], out_count, true); }
+
+-            // BLOB: use SetValue for safety across vector types
+-            if (!r.blob.empty()) {
+-                auto &col = output.data[15];
+-                FlatVector::GetData<string_t>(col)[out_count] =
+-                    StringVector::AddStringOrBlob(col, r.blob);
+-                FlatVector::SetNull(col, out_count, false);
+-            } else {
+-                FlatVector::SetNull(output.data[15], out_count, true);
+-            }
++            // BLOB via SetValue (future-proof against non-flat vectors)
++            if (!r.blob.empty()) { output.SetValue(15, out_count, Value::BLOB_RAW(r.blob)); }
++            else { FlatVector::SetNull(output.data[15], out_count, true); }
+
+             out_count++;
+             state.current_output_row++;
+         }
+
+         output.SetCardinality(out_count);
+
+         if (state.current_output_row >= state.current_results.size()) {
+             state.current_input_row++;
+             state.initialized_row = false;
+         }
+
+         if (out_count > 0) {
+             return OperatorResultType::HAVE_MORE_OUTPUT;
+         }
+     }
+ }
+
+
+# ----------------------------------------------------
+# Patch 4: Scalar UDF `git_uri` — force FLAT result in general path
+# ----------------------------------------------------
+diff --git a/src/git_functions.cpp b/src/git_functions.cpp
+--- a/src/git_functions.cpp
++++ b/src/git_functions.cpp
+@@ -AAAA,20 +AAAA,26 @@
+ static void GitUriFunction(DataChunk &args, ExpressionState &state, Vector &result) {
+     // fast-path: if all inputs are constant, you already set CONSTANT and write a single slot, then return
+     if (args.AllConstant()) {
+         // existing constant path — keep as-is
+         return;
+     }
+
+-    // general path (non-constant and/or dictionary inputs)
++    // general path (non-constant and/or dictionary inputs):
++    // force result to FLAT before per-row writes
++    result.SetVectorType(VectorType::FLAT_VECTOR);
+
+     UnifiedVectorFormat repo_fmt, file_fmt, ref_fmt;
+     args.data[0].ToUnifiedFormat(args.size(), repo_fmt);
+     args.data[1].ToUnifiedFormat(args.size(), file_fmt);
+     args.data[2].ToUnifiedFormat(args.size(), ref_fmt);
+
+     auto repo = UnifiedVectorFormat::GetData<string_t>(repo_fmt);
+     auto file = UnifiedVectorFormat::GetData<string_t>(file_fmt);
+     auto ref  = UnifiedVectorFormat::GetData<string_t>(ref_fmt);
+
+     auto out = FlatVector::GetData<string_t>(result);
+     for (idx_t i = 0; i < args.size(); i++) {
+         const auto ri = repo_fmt.sel->get_index(i);
+         const auto fi = file_fmt.sel->get_index(i);
+         const auto ci = ref_fmt.sel->get_index(i);
+
+         if (!repo_fmt.validity.RowIsValid(ri) ||
+             !file_fmt.validity.RowIsValid(fi) ||
+             !ref_fmt.validity.RowIsValid(ci)) {
+             FlatVector::SetNull(result, i, true);
+             continue;
+         }
+
+         const auto uri = BuildGitURI(repo[ri].GetString(), file[fi].GetString(), ref[ci].GetString());
+         out[i] = StringVector::AddString(result, uri);
+     }
+ }
+
+
+# ----------------------------------------------------
+# Patch 5: Plain table function `git_read` — write BLOB via SetValue
+# ----------------------------------------------------
+diff --git a/src/git_functions.cpp b/src/git_functions.cpp
+--- a/src/git_functions.cpp
++++ b/src/git_functions.cpp
+@@ -BBBB,20 +BBBB,18 @@
+ static void GitReadFunction(ClientContext &context,
+                             TableFunctionInput &data_p,
+                             DataChunk &output) {
+     // ... compute `result` struct with fields including `blob` ...
+-    if (!result.blob.empty()) {
+-        auto &col = output.data[15];
+-        FlatVector::GetData<string_t>(col)[0] =
+-            StringVector::AddStringOrBlob(col, result.blob);
+-        FlatVector::SetNull(col, 0, false);
+-    } else {
+-        FlatVector::SetNull(output.data[15], 0, true);
+-    }
++    if (!result.blob.empty()) { output.SetValue(15, 0, Value::BLOB_RAW(result.blob)); }
++    else { FlatVector::SetNull(output.data[15], 0, true); }
+     output.SetCardinality(1);
+ }
+
+
+# ----------------------------------------------------
+# Patch 6: New tests to lock behavior under ASan/verification
+# ----------------------------------------------------
+diff --git a/test/sql/asan_hardening_lateral.test b/test/sql/asan_hardening_lateral.test
+new file mode 100644
+--- /dev/null
++++ b/test/sql/asan_hardening_lateral.test
+@@ -0,0 +1,74 @@
++# name: asan_hardening_lateral
++require duck_tails
++
++statement ok
++PRAGMA enable_verification;
++
++# constant input (CONSTANT_VECTOR) routed to LATERAL
++query I
++WITH t(repo) AS (
++  SELECT CONCAT('git://', FIXTURE_PATH(), '@HEAD')
++)
++SELECT COUNT(*) FROM t, LATERAL git_tree_each(t.repo);
++----
++1
++
++# dictionary input (selection vector) routed to LATERAL
++query I
++WITH base(repo) AS (
++  SELECT FIXTURE_PATH() UNION ALL SELECT FIXTURE_PATH()
++)
++SELECT COUNT(*)
++FROM base b, LATERAL git_read_each(CONCAT('git://', b.repo, '/README.md@HEAD'));
++----
++2
++
++# chained LATERAL: tree -> read_each
++query II
++PRAGMA threads=4;
++SELECT COUNT(*)
++FROM git_tree(CONCAT('git://', FIXTURE_PATH(), '@HEAD')) t
++CROSS JOIN LATERAL git_read_each(t.git_uri) r
++WHERE t.file_path LIKE '%.md';
++----
++0  # (count is data-dependent; adjust expected if your fixture guarantees at least 1)
++
+diff --git a/test/sql/git_read_each_negative_direct.test b/test/sql/git_read_each_negative_direct.test
+new file mode 100644
+--- /dev/null
++++ b/test/sql/git_read_each_negative_direct.test
+@@ -0,0 +1,17 @@
++# name: git_read_each_negative_direct
++require duck_tails
++
++statement ok
++PRAGMA enable_verification;
++
++# *_each must be LATERAL-only; direct call should raise
++statement error
++SELECT * FROM git_read_each(CONCAT('git://', FIXTURE_PATH(), '/README.md@HEAD'));
++

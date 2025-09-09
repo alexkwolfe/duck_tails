@@ -1,0 +1,15 @@
+# Test only git_tree LATERAL joins
+statement ok
+PRAGMA threads=1;
+
+statement ok
+LOAD duck_tails;
+
+# Test git_tree_each -> git_log_each LATERAL join
+query I
+SELECT COUNT(*)
+FROM git_tree_each('git://.@HEAD') t
+CROSS JOIN LATERAL git_log_each(t.git_uri) l
+WHERE t.file_path = 'README.md';
+----
+58

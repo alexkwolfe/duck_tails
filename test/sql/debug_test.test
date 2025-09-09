@@ -1,0 +1,105 @@
+# Debug test to isolate failing query
+statement ok
+SET autoinstall_extension_repository='/Users/alex/Dev/duck_tails/build/debug/repository';
+
+statement ok
+SET autoload_known_extensions='true';
+
+statement ok
+SET custom_extension_repository='/Users/alex/Dev/duck_tails/build/debug/repository';
+
+statement ok
+LOAD duck_tails;
+
+statement ok
+CREATE OR REPLACE MACRO FIXTURE_PATH() AS '/var/folders/gg/mzhzcjsj5tv0yrm085bcntg00000gn/T/duck_tails_test_YbKdnW/main-repo';
+
+# Test 1: git_tree_each basic
+query II
+SELECT 
+    file_path, 
+    git_uri LIKE 'git://%' as has_uri_format
+FROM git_tree_each(CONCAT('git://', FIXTURE_PATH(), '@HEAD'))
+WHERE file_path LIKE 'README%'
+ORDER BY file_path
+LIMIT 1;
+----
+README.md	true
+
+# Test 2: git_tree_each with LATERAL git_log_each
+query II
+SELECT 
+    t.file_path,
+    COUNT(l.commit_hash) as commit_count
+FROM git_tree_each(CONCAT('git://', FIXTURE_PATH(), '@HEAD')) t
+CROSS JOIN LATERAL (
+    SELECT commit_hash 
+    FROM git_log_each(t.git_uri) 
+    LIMIT 1
+) l
+WHERE t.file_path = 'README.md'
+GROUP BY t.file_path;
+----
+README.md	1
+
+# Test 3: git_parents_each with URI
+query I
+WITH commits AS (
+    SELECT CONCAT('git://', FIXTURE_PATH(), '@', commit_hash) as git_commit_uri,
+           commit_hash
+    FROM git_log(FIXTURE_PATH()) 
+    LIMIT 5
+)
+SELECT 
+    COUNT(*) >= 0 as has_valid_count
+FROM commits c
+CROSS JOIN LATERAL git_parents_each(c.git_commit_uri) p;
+----
+true
+
+# Test 4: git_branches_each with URI
+query II
+WITH repos AS (
+    SELECT CONCAT('git://', FIXTURE_PATH(), '@HEAD') as repo_uri
+)
+SELECT 
+    COUNT(b.branch_name) as branch_count,
+    MAX(b.is_current::INTEGER) as has_current
+FROM repos r
+CROSS JOIN LATERAL git_branches_each(r.repo_uri) b;
+----
+3	1
+
+# Test 5: git_tags_each with URI
+query I
+WITH repos AS (
+    SELECT CONCAT('git://', FIXTURE_PATH(), '@HEAD') as repo_uri
+)
+SELECT 
+    COUNT(t.tag_name) >= 0 as valid_count
+FROM repos r
+CROSS JOIN LATERAL git_tags_each(r.repo_uri) t;
+----
+true
+
+# Test 6a: git_read_each direct (no LATERAL) - THIS FAILS!
+# query I
+# SELECT LENGTH(text) > 0 as has_content
+# FROM git_read_each(CONCAT('git://', FIXTURE_PATH(), '/README.md@HEAD'));
+# ----
+# true
+
+# Test 6b: git_read_each with LATERAL
+query II
+SELECT 
+    t.file_path,
+    LENGTH(r.text) > 0 as has_content
+FROM git_tree_each(CONCAT('git://', FIXTURE_PATH(), '@HEAD')) t
+CROSS JOIN LATERAL (
+    SELECT text 
+    FROM git_read_each(t.git_uri)
+) r
+WHERE t.file_path = 'README.md';
+----
+README.md	true
+

@@ -1,0 +1,17 @@
+# Test non-LATERAL git_read
+statement ok
+LOAD duck_tails;
+
+# Non-LATERAL git_read function  
+query I
+SELECT LENGTH(text) > 0 as has_content
+FROM git_read('README.md', repo_path => '/var/folders/gg/mzhzcjsj5tv0yrm085bcntg00000gn/T/duck_tails_test_YbKdnW/main-repo');
+----
+true
+
+# git_read with git:// URI format
+query I
+SELECT LENGTH(text) > 0 as has_content
+FROM git_read('git:///var/folders/gg/mzhzcjsj5tv0yrm085bcntg00000gn/T/duck_tails_test_YbKdnW/main-repo/README.md@HEAD');
+----
+true

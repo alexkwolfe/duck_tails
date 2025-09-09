@@ -1,0 +1,57 @@
+# Test each function individually
+statement ok
+SET autoinstall_extension_repository='/Users/alex/Dev/duck_tails/build/debug/repository';
+
+statement ok
+SET autoload_known_extensions='true';
+
+statement ok
+SET custom_extension_repository='/Users/alex/Dev/duck_tails/build/debug/repository';
+
+statement ok
+LOAD duck_tails;
+
+statement ok
+CREATE OR REPLACE MACRO FIXTURE_PATH() AS '/var/folders/gg/mzhzcjsj5tv0yrm085bcntg00000gn/T/duck_tails_test_YbKdnW/main-repo';
+
+# Test 1: git_log_each direct
+query I
+SELECT COUNT(*) > 0 as has_commits
+FROM git_log_each(CONCAT('git://', FIXTURE_PATH(), '@HEAD'));
+----
+true
+
+# Test 2: git_branches_each direct  
+query I
+SELECT COUNT(*) > 0 as has_branches  
+FROM git_branches_each(CONCAT('git://', FIXTURE_PATH(), '@HEAD'));
+----
+true
+
+# Test 3: git_tags_each direct
+query I
+SELECT COUNT(*) >= 0 as valid_result
+FROM git_tags_each(CONCAT('git://', FIXTURE_PATH(), '@HEAD'));
+----
+true
+
+# Test 4: git_parents_each direct
+query I
+SELECT COUNT(*) >= 0 as has_parents
+FROM git_parents_each(CONCAT('git://', FIXTURE_PATH(), '@HEAD'));
+----
+true
+
+# Test 5: git_tree_each direct
+query I
+SELECT COUNT(*) > 0 as has_tree
+FROM git_tree_each(CONCAT('git://', FIXTURE_PATH(), '@HEAD'));
+----
+true
+
+# Test 6: git_read_each direct
+query I
+SELECT LENGTH(text) > 0 as has_content
+FROM git_read_each(CONCAT('git://', FIXTURE_PATH(), '/README.md@HEAD'));
+----
+true

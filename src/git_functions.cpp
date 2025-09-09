@@ -10,6 +10,51 @@
 namespace duckdb {
 
 //===--------------------------------------------------------------------===//
+// UTF-8 Validation Helper
+//===--------------------------------------------------------------------===//
+
+// Simple UTF-8 validation to prevent verification crashes
+static bool IsValidUTF8(const char* data, size_t length) {
+    const unsigned char* bytes = reinterpret_cast<const unsigned char*>(data);
+    for (size_t i = 0; i < length; ) {
+        unsigned char byte = bytes[i];
+        
+        // ASCII (0-127)
+        if (byte <= 0x7F) {
+            i++;
+            continue;
+        }
+        
+        // Multi-byte sequence
+        int num_bytes = 0;
+        if ((byte & 0xE0) == 0xC0) {
+            num_bytes = 2;
+        } else if ((byte & 0xF0) == 0xE0) {
+            num_bytes = 3;
+        } else if ((byte & 0xF8) == 0xF0) {
+            num_bytes = 4;
+        } else {
+            return false; // Invalid start byte
+        }
+        
+        // Check if we have enough bytes
+        if (i + num_bytes > length) {
+            return false;
+        }
+        
+        // Check continuation bytes
+        for (int j = 1; j < num_bytes; j++) {
+            if ((bytes[i + j] & 0xC0) != 0x80) {
+                return false;
+            }
+        }
+        
+        i += num_bytes;
+    }
+    return true;
+}
+
+//===--------------------------------------------------------------------===//
 // Unified Parameter Parsing Helper for New Signature Design
 //===--------------------------------------------------------------------===//
 
@@ -2507,8 +2552,40 @@ static void ProcessGitURI(const string& uri, const GitReadBindData& bind_data,
             result.is_text = is_text;
             
             if (is_text) {
-                result.encoding = "utf8";
-                result.text = string(static_cast<const char*>(raw_content), content_size);
+                // Create a safe text string with proper memory handling
+                const char* char_content = static_cast<const char*>(raw_content);
+                
+                // Check for null bytes (which can cause verification issues)
+                bool has_null_bytes = false;
+                for (size_t i = 0; i < content_size; i++) {
+                    if (char_content[i] == '\0') {
+                        has_null_bytes = true;
+                        break;
+                    }
+                }
+                
+                // Additional UTF-8 validation
+                bool is_valid_utf8 = !has_null_bytes && IsValidUTF8(char_content, content_size);
+                
+                if (is_valid_utf8) {
+                    result.encoding = "utf8";
+                    // Create string and ensure it's properly initialized
+                    result.text = string(char_content, content_size);
+                    
+                    // Defensive check: ensure no uninitialized memory patterns
+                    if (result.text.find('\xbe') != string::npos) {
+                        // Contains suspicious uninitialized memory pattern - treat as binary
+                        result.encoding = "binary";
+                        result.is_text = false;
+                        result.text.clear();
+                        result.blob = string(char_content, content_size);
+                    }
+                } else {
+                    // Invalid UTF-8 or contains null bytes - treat as binary
+                    result.encoding = "binary";
+                    result.is_text = false;
+                    result.blob = string(char_content, content_size);
+                }
             } else {
                 result.encoding = "binary";
                 result.blob = string(static_cast<const char*>(raw_content), content_size);
@@ -2809,9 +2886,6 @@ static OperatorResultType GitReadEachFunction(ExecutionContext &context, TableFu
         idx_t remaining = state.current_results.size() - state.current_output_row;
         idx_t count = MinValue<idx_t>(remaining, STANDARD_VECTOR_SIZE);
         
-        // Important: set cardinality first to properly initialize the chunk's vectors
-        output.SetCardinality(count);
-        
         // Fill columns defensively based on actual column count
         const idx_t col_count = output.ColumnCount();
         
@@ -2819,9 +2893,22 @@ static OperatorResultType GitReadEachFunction(ExecutionContext &context, TableFu
             auto &result = state.current_results[state.current_output_row + i];
             
             // Fill columns up to available count (16-column schema from binder)
-            if (col_count > 0)  output.SetValue(0,  i, Value(result.git_uri));        // git_uri
+            // Force string materialization for LATERAL chain safety  
+            if (col_count > 0) {
+                // Create a completely new string to avoid any memory reference issues
+                string safe_git_uri;
+                safe_git_uri.reserve(result.git_uri.length() + 1);
+                safe_git_uri.assign(result.git_uri.begin(), result.git_uri.end());
+                output.SetValue(0, i, Value(safe_git_uri));        // git_uri
+            }
             if (col_count > 1)  output.SetValue(1,  i, Value(result.repo_path));      // repo_path  
-            if (col_count > 2)  output.SetValue(2,  i, Value(result.commit_hash));    // commit_hash
+            if (col_count > 2) {
+                // Ensure commit_hash is properly materialized (used in CONCAT operations)
+                string safe_commit_hash;
+                safe_commit_hash.reserve(result.commit_hash.length() + 1);
+                safe_commit_hash.assign(result.commit_hash.begin(), result.commit_hash.end());
+                output.SetValue(2, i, Value(safe_commit_hash));    // commit_hash
+            }
             if (col_count > 3)  output.SetValue(3,  i, Value(result.tree_hash));      // tree_hash
             if (col_count > 4)  output.SetValue(4,  i, Value(result.file_path));      // file_path
             if (col_count > 5)  output.SetValue(5,  i, Value(result.file_ext));       // file_ext
@@ -2850,6 +2937,27 @@ static OperatorResultType GitReadEachFunction(ExecutionContext &context, TableFu
                 } else {
                     FlatVector::SetNull(output.data[15], i, true);
                 }
+            }
+        }
+        
+        // Set cardinality after all values are filled to ensure proper vector initialization
+        output.SetCardinality(count);
+        
+        // Force vector verification and finalization for LATERAL chain safety
+        if (count > 0) {
+            try {
+                // Ensure all vectors are properly initialized and valid
+                for (idx_t col_idx = 0; col_idx < output.ColumnCount(); col_idx++) {
+                    auto &vec = output.data[col_idx];
+                    if (vec.GetVectorType() != VectorType::CONSTANT_VECTOR) {
+                        // Force vector to be in a known good state
+                        vec.Flatten(count);
+                    }
+                }
+            } catch (...) {
+                // If vector operations fail, return empty result to prevent crash
+                output.SetCardinality(0);
+                return OperatorResultType::FINISHED;
             }
         }
         

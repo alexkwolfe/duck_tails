@@ -1,0 +1,20 @@
+# Minimal LATERAL join test
+statement ok
+PRAGMA threads=1;
+
+statement ok
+LOAD duck_tails;
+
+# Simple test that should work
+query I
+SELECT COUNT(*) FROM git_tree_each('git://.@HEAD');
+----
+100
+
+# The problematic LATERAL join
+query I
+SELECT COUNT(*)
+FROM git_tree_each('git://.@HEAD') t
+CROSS JOIN LATERAL git_log_each(t.git_uri) l;
+----
+5800
