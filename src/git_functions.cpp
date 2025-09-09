@@ -133,24 +133,24 @@ static void DefineGitParentsSchema(vector<LogicalType> &return_types, vector<str
     names = {"repo_path", "commit_hash", "parent_hash", "parent_index"};
 }
 
-// Output helper for git_tree rows (repo_path is REQUIRED)
+// Output helper for git_tree rows (repo_path is REQUIRED) - SAFE VERSION
 static void OutputGitTreeRow(DataChunk &output, idx_t row_idx, 
                              const GitTreeRow &row, const string &repo_path) {
-    // Use StringVector::AddString for proper string lifecycle management (like pre-refactor version)
-    FlatVector::GetData<string_t>(output.data[0])[row_idx] = StringVector::AddString(output.data[0], row.git_uri);
-    FlatVector::GetData<string_t>(output.data[1])[row_idx] = StringVector::AddString(output.data[1], repo_path);
-    FlatVector::GetData<string_t>(output.data[2])[row_idx] = StringVector::AddString(output.data[2], row.commit_hash);
-    FlatVector::GetData<string_t>(output.data[3])[row_idx] = StringVector::AddString(output.data[3], row.tree_hash);
-    FlatVector::GetData<string_t>(output.data[4])[row_idx] = StringVector::AddString(output.data[4], row.file_path);
-    FlatVector::GetData<string_t>(output.data[5])[row_idx] = StringVector::AddString(output.data[5], row.file_ext);
-    FlatVector::GetData<string_t>(output.data[6])[row_idx] = StringVector::AddString(output.data[6], row.ref);
-    FlatVector::GetData<string_t>(output.data[7])[row_idx] = StringVector::AddString(output.data[7], row.blob_hash);
-    FlatVector::GetData<timestamp_t>(output.data[8])[row_idx] = row.commit_date;
-    FlatVector::GetData<int32_t>(output.data[9])[row_idx] = row.mode;
-    FlatVector::GetData<int64_t>(output.data[10])[row_idx] = row.size_bytes;
-    FlatVector::GetData<string_t>(output.data[11])[row_idx] = StringVector::AddString(output.data[11], row.kind);
-    FlatVector::GetData<bool>(output.data[12])[row_idx] = row.is_text;
-    FlatVector::GetData<string_t>(output.data[13])[row_idx] = StringVector::AddString(output.data[13], row.encoding);
+    // Use safe SetValue pattern instead of direct FlatVector access (Our Fix #1)
+    output.SetValue(0, row_idx, Value(row.git_uri));
+    output.SetValue(1, row_idx, Value(repo_path));
+    output.SetValue(2, row_idx, Value(row.commit_hash));
+    output.SetValue(3, row_idx, Value(row.tree_hash));
+    output.SetValue(4, row_idx, Value(row.file_path));
+    output.SetValue(5, row_idx, Value(row.file_ext));
+    output.SetValue(6, row_idx, Value(row.ref));
+    output.SetValue(7, row_idx, Value(row.blob_hash));
+    output.SetValue(8, row_idx, Value::TIMESTAMP(row.commit_date));
+    output.SetValue(9, row_idx, Value::INTEGER(row.mode));
+    output.SetValue(10, row_idx, Value::BIGINT(row.size_bytes));
+    output.SetValue(11, row_idx, Value(row.kind));
+    output.SetValue(12, row_idx, Value::BOOLEAN(row.is_text));
+    output.SetValue(13, row_idx, Value(row.encoding));
 }
 
 // Output helper for git_parents rows (repo_path is REQUIRED)
@@ -2646,42 +2646,32 @@ static void GitReadFunction(ClientContext &context, TableFunctionInput &input, D
     GitReadLocalState::ReadResult result;
     ProcessGitURI(bind_data.uri, bind_data, result);
     
-    // Fill output row - matches new schema order
-    FlatVector::GetData<string_t>(output.data[0])[0] = 
-        StringVector::AddString(output.data[0], result.git_uri);     // git_uri
-    FlatVector::GetData<string_t>(output.data[1])[0] = 
-        StringVector::AddString(output.data[1], result.repo_path);   // repo_path
-    FlatVector::GetData<string_t>(output.data[2])[0] = 
-        StringVector::AddString(output.data[2], result.commit_hash); // commit_hash
-    FlatVector::GetData<string_t>(output.data[3])[0] = 
-        StringVector::AddString(output.data[3], result.tree_hash);   // tree_hash
-    FlatVector::GetData<string_t>(output.data[4])[0] = 
-        StringVector::AddString(output.data[4], result.file_path);   // file_path
-    FlatVector::GetData<string_t>(output.data[5])[0] = 
-        StringVector::AddString(output.data[5], result.file_ext);    // file_ext
-    FlatVector::GetData<string_t>(output.data[6])[0] = 
-        StringVector::AddString(output.data[6], result.ref);         // ref
-    FlatVector::GetData<string_t>(output.data[7])[0] = 
-        StringVector::AddString(output.data[7], result.blob_hash);   // blob_hash
-    FlatVector::GetData<int32_t>(output.data[8])[0] = result.mode;   // mode
-    FlatVector::GetData<string_t>(output.data[9])[0] = 
-        StringVector::AddString(output.data[9], result.kind);        // kind
-    FlatVector::GetData<bool>(output.data[10])[0] = result.is_text;  // is_text
-    FlatVector::GetData<string_t>(output.data[11])[0] = 
-        StringVector::AddString(output.data[11], result.encoding);   // encoding
-    FlatVector::GetData<int64_t>(output.data[12])[0] = result.size_bytes; // size_bytes
-    FlatVector::GetData<bool>(output.data[13])[0] = result.truncated; // truncated
+    // Fill output row using safe SetValue pattern (Our Fix #2)
+    output.SetValue(0, 0, Value(result.git_uri));        // git_uri
+    output.SetValue(1, 0, Value(result.repo_path));      // repo_path
+    output.SetValue(2, 0, Value(result.commit_hash));    // commit_hash
+    output.SetValue(3, 0, Value(result.tree_hash));      // tree_hash
+    output.SetValue(4, 0, Value(result.file_path));      // file_path
+    output.SetValue(5, 0, Value(result.file_ext));       // file_ext
+    output.SetValue(6, 0, Value(result.ref));            // ref
+    output.SetValue(7, 0, Value(result.blob_hash));      // blob_hash
+    output.SetValue(8, 0, Value::INTEGER(result.mode));  // mode
+    output.SetValue(9, 0, Value(result.kind));           // kind
+    output.SetValue(10, 0, Value::BOOLEAN(result.is_text)); // is_text
+    output.SetValue(11, 0, Value(result.encoding));      // encoding
+    output.SetValue(12, 0, Value::BIGINT(result.size_bytes)); // size_bytes
+    output.SetValue(13, 0, Value::BOOLEAN(result.truncated)); // truncated
     
+    // Handle TEXT column
     if (!result.text.empty()) {
-        FlatVector::GetData<string_t>(output.data[14])[0] = 
-            StringVector::AddString(output.data[14], result.text);   // text
+        output.SetValue(14, 0, Value(result.text));      // text
     } else {
         FlatVector::SetNull(output.data[14], 0, true);
     }
     
+    // BLOB via SetValue (future-proof against non-flat vectors)
     if (!result.blob.empty()) {
-        FlatVector::GetData<string_t>(output.data[15])[0] = 
-            StringVector::AddStringOrBlob(output.data[15], result.blob); // blob
+        output.SetValue(15, 0, Value::BLOB_RAW(result.blob));
     } else {
         FlatVector::SetNull(output.data[15], 0, true);
     }
@@ -2694,40 +2684,12 @@ static void GitReadFunction(ClientContext &context, TableFunctionInput &input, D
 static unique_ptr<FunctionData> GitReadEachBind(ClientContext &context, TableFunctionBindInput &input,
                                           vector<LogicalType> &return_types, vector<string> &names) {
     
-    // Check if this is a direct call (has input.inputs[0]) or LATERAL call (input comes at runtime)
-    string uri_for_direct_call = "";
-    bool is_direct_call = false;
-    
-    if (!input.inputs.empty() && !input.inputs[0].IsNull()) {
-        // Direct call - process the URI/path and optional ref
-        string first_param = input.inputs[0].GetValue<string>();
-        string ref = "HEAD";  // Default ref
-        
-        // Check for explicit ref parameter in direct call
-        if (input.inputs.size() >= 2 && !input.inputs[1].IsNull() && 
-            input.inputs[1].type().id() == LogicalTypeId::VARCHAR) {
-            ref = input.inputs[1].GetValue<string>();
-        }
-        
-        // Build complete URI for direct call
-        if (StringUtil::StartsWith(first_param, "git://")) {
-            // Validate no conflicting refs
-            try {
-                auto git_path = GitPath::Parse(first_param);
-                if (!git_path.revision.empty() && ref != "HEAD") {
-                    throw BinderException("git_read_each: Conflicting ref specifications: git:// URI contains '@%s' but function parameter specifies '%s'", 
-                                        git_path.revision, ref);
-                }
-            } catch (const std::exception &e) {
-                // If parsing fails, let ProcessGitURI handle the error
-            }
-            uri_for_direct_call = first_param;
-        } else {
-            // Filesystem path - build git:// URI with ref
-            uri_for_direct_call = "git://" + first_param + "@" + ref;
-        }
-        is_direct_call = true;
+    // LATERAL-only: reject direct calls, arguments arrive at runtime via input DataChunk
+    if (!input.inputs.empty()) {
+        throw BinderException("git_read_each is LATERAL-only. For direct calls, use git_read(...) instead");
     }
+    const string uri_for_direct_call = "";
+    const bool is_direct_call = false;
     
     // Set default parameters
     int64_t max_bytes = -1;  // No limit by default
@@ -2736,30 +2698,8 @@ static unique_ptr<FunctionData> GitReadEachBind(ClientContext &context, TableFun
     string filters = "raw";
     string repo_path = ".";
     
-    // Handle optional parameters with new unified signature:
-    // repo_path_or_uri_with_file (from LATERAL), [ref], [max_bytes], [decode_base64], [transcode]
-    // The ref parameter is now at index 1, max_bytes at index 2
-    // Note: For direct calls with ref, the parameter indices shift
-    int param_offset = is_direct_call && input.inputs.size() >= 2 && 
-                      input.inputs[1].type().id() == LogicalTypeId::VARCHAR ? 2 : 1;
-    
-    if (input.inputs.size() > param_offset && !input.inputs[param_offset].IsNull() && 
-        input.inputs[param_offset].type().id() == LogicalTypeId::BIGINT) {
-        max_bytes = input.inputs[param_offset].GetValue<int64_t>();
-        param_offset++;
-    }
-    if (input.inputs.size() > param_offset && !input.inputs[param_offset].IsNull()) {
-        decode_base64 = input.inputs[param_offset].GetValue<string>();
-        param_offset++;
-    }
-    if (input.inputs.size() > param_offset + 1 && !input.inputs[param_offset + 1].IsNull()) {
-        transcode = input.inputs[param_offset + 1].GetValue<string>();
-    }
-    if (input.inputs.size() > param_offset + 2 && !input.inputs[param_offset + 2].IsNull()) {
-        filters = input.inputs[param_offset + 2].GetValue<string>();
-    }
-    
-    // Check for repo_path named parameter
+    // LATERAL-only: only named parameters are processed at bind time
+    // Runtime parameters (repo_path_or_uri, ref, etc.) come via input DataChunk
     for (const auto &kv : input.named_parameters) {
         if (kv.first == "repo_path") {
             repo_path = kv.second.GetValue<string>();
@@ -2790,9 +2730,8 @@ static unique_ptr<FunctionData> GitReadEachBind(ClientContext &context, TableFun
              "ref", "blob_hash", "mode", "kind", "is_text", "encoding", "size_bytes", 
              "truncated", "text", "blob"};
     
-    // Don't store URI in bind_data - it always comes from input DataChunk for LATERAL functions
-    // Store the URI if this is a direct call, otherwise empty string for LATERAL
-    return make_uniq<GitReadBindData>(max_bytes, decode_base64, transcode, filters, repo_path, uri_for_direct_call);
+    // LATERAL-only: never store URI in bind_data, it always comes from input DataChunk
+    return make_uniq<GitReadBindData>(max_bytes, decode_base64, transcode, filters, repo_path, "");
 }
 
 static unique_ptr<LocalTableFunctionState> GitReadLocalInit(ExecutionContext &context, 
@@ -2808,107 +2747,50 @@ static OperatorResultType GitReadEachFunction(ExecutionContext &context, TableFu
     auto &bind_data = data_p.bind_data->Cast<GitReadBindData>();
     auto &state = data_p.local_state->Cast<GitReadLocalState>();
     
-    // Handle direct calls (literal URI provided) vs LATERAL calls (URI from input)
-    if (!bind_data.uri.empty()) {
-        // Direct call mode - process the literal URI like git_read
-        // This handles cases like: SELECT * FROM git_read_each('git://file@HEAD')
-        if (!state.initialized_row) {
-            GitReadLocalState::ReadResult result;
-            ProcessGitURI(bind_data.uri, bind_data, result);
-            state.current_results.clear();
-            state.current_results.push_back(result);
-            
-            state.initialized_row = true;
-            state.current_output_row = 0;
-        }
-    }
+    // LATERAL-only; inputs flow via 'input' data chunk
+    
+    // Defensive invariants (debug builds) 
+    // Note: output.ColumnCount() may differ from schema in LATERAL context
+    D_ASSERT(input.ColumnCount() >= 1);
     
     // LATERAL mode - process input chunk
     while (true) {
         if (!state.initialized_row) {
-            
-            // initialize for the current input row
             if (state.current_input_row >= input.size()) {
-                // ran out of rows
                 state.current_input_row = 0;
                 state.initialized_row = false;
                 return OperatorResultType::NEED_MORE_INPUT;
             }
             
-            // LATERAL function: extract URI from input DataChunk
-            input.Flatten();
-            
-            // Check if input has columns and data
-            if (input.ColumnCount() == 0) {
-                throw BinderException("git_read_each: no input columns available");
-            }
-            
-            // Check if the input is null
-            if (FlatVector::IsNull(input.data[0], state.current_input_row)) {
-                // Move to next input row if null
+            // Read inputs via UnifiedVectorFormat (dictionary/constant safe)
+            UnifiedVectorFormat repo_fmt;
+            input.data[0].ToUnifiedFormat(input.size(), repo_fmt);
+            const auto *repo_vals = UnifiedVectorFormat::GetData<string_t>(repo_fmt);
+            const auto ridx = repo_fmt.sel->get_index(state.current_input_row);
+            if (!repo_fmt.validity.RowIsValid(ridx)) {
                 state.current_input_row++;
                 state.initialized_row = false;
-                continue;
+                continue; // NULL repo/URI row
             }
+            const string first_param = repo_vals[ridx].GetString();
             
-            // Extract repo_path_or_uri from input DataChunk - direct string_t access
-            auto data = FlatVector::GetData<string_t>(input.data[0]);
-            if (!data) {
-                throw BinderException("git_read_each: no string data in input column");
+            string explicit_ref;
+            if (input.ColumnCount() > 1) {
+                UnifiedVectorFormat ref_fmt;
+                input.data[1].ToUnifiedFormat(input.size(), ref_fmt);
+                const auto *ref_vals = UnifiedVectorFormat::GetData<string_t>(ref_fmt);
+                const auto r2idx = ref_fmt.sel->get_index(state.current_input_row);
+                if (ref_fmt.validity.RowIsValid(r2idx)) {
+                    explicit_ref = ref_vals[r2idx].GetString();
+                }
             }
-            
-            // Get the string_t directly and convert to string
-            auto string_t_value = data[state.current_input_row];
-            string first_param = string(string_t_value.GetData(), string_t_value.GetSize());
-            
-            if (first_param.empty()) {
-                throw BinderException("git_read_each: received empty repo_path_or_uri from input");
-            }
-            
-            // Build URI from LATERAL input
+
+            // Canonicalize URI
             string uri;
             if (StringUtil::StartsWith(first_param, "git://")) {
-                // git:// URI from LATERAL input
-                // Check for ref conflict if there's a second column
-                if (input.ColumnCount() > 1) {
-                    string explicit_ref = "";
-                    if (!FlatVector::IsNull(input.data[1], state.current_input_row)) {
-                        auto ref_data = FlatVector::GetData<string_t>(input.data[1]);
-                        if (ref_data) {
-                            auto ref_string_t = ref_data[state.current_input_row];
-                            explicit_ref = string(ref_string_t.GetData(), ref_string_t.GetSize());
-                        }
-                    }
-                    
-                    // Check if git:// URI has embedded ref and explicit ref was also provided
-                    if (!explicit_ref.empty()) {
-                        try {
-                            auto git_path = GitPath::Parse(first_param);
-                            if (!git_path.revision.empty()) {
-                                throw BinderException("git_read_each: Conflicting ref specifications: git:// URI contains '@%s' but function parameter specifies '%s'", 
-                                                    git_path.revision, explicit_ref);
-                            }
-                        } catch (const std::exception &e) {
-                            // If parsing fails, let ProcessGitURI handle the error
-                        }
-                    }
-                }
-                
-                uri = first_param;  // Use git:// URI as-is
+                uri = explicit_ref.empty() ? first_param : first_param + "@" + explicit_ref;
             } else {
-                // Filesystem path from LATERAL input - need to convert to git:// URI
-                string ref = "HEAD";  // Default ref
-                
-                // Read ref from input if available (LATERAL mode only)
-                if (input.ColumnCount() > 1 && !FlatVector::IsNull(input.data[1], state.current_input_row)) {
-                    auto ref_data = FlatVector::GetData<string_t>(input.data[1]);
-                    if (ref_data) {
-                        auto ref_string_t = ref_data[state.current_input_row];
-                        ref = string(ref_string_t.GetData(), ref_string_t.GetSize());
-                    }
-                }
-                
-                // Build git:// URI with ref
+                const string &ref = explicit_ref.empty() ? string("HEAD") : explicit_ref;
                 uri = "git://" + first_param + "@" + ref;
             }
             
@@ -2930,35 +2812,44 @@ static OperatorResultType GitReadEachFunction(ExecutionContext &context, TableFu
         // Important: set cardinality first to properly initialize the chunk's vectors
         output.SetCardinality(count);
         
+        // Fill columns defensively based on actual column count
+        const idx_t col_count = output.ColumnCount();
+        
         for (idx_t i = 0; i < count; i++) {
             auto &result = state.current_results[state.current_output_row + i];
             
-            // Use SetValue for safe column filling - matches 16-column schema from GitReadEachBind
-            output.SetValue(0,  i, Value(result.git_uri));        // git_uri
-            output.SetValue(1,  i, Value(result.repo_path));      // repo_path  
-            output.SetValue(2,  i, Value(result.commit_hash));    // commit_hash
-            output.SetValue(3,  i, Value(result.tree_hash));      // tree_hash
-            output.SetValue(4,  i, Value(result.file_path));      // file_path
-            output.SetValue(5,  i, Value(result.file_ext));       // file_ext
-            output.SetValue(6,  i, Value(result.ref));            // ref
-            output.SetValue(7,  i, Value(result.blob_hash));      // blob_hash
-            output.SetValue(8,  i, Value::INTEGER(result.mode));  // mode
-            output.SetValue(9,  i, Value(result.kind));           // kind
-            output.SetValue(10, i, Value::BOOLEAN(result.is_text)); // is_text
-            output.SetValue(11, i, Value(result.encoding));       // encoding
-            output.SetValue(12, i, Value::BIGINT(result.size_bytes)); // size_bytes
-            output.SetValue(13, i, Value::BOOLEAN(result.truncated)); // truncated
+            // Fill columns up to available count (16-column schema from binder)
+            if (col_count > 0)  output.SetValue(0,  i, Value(result.git_uri));        // git_uri
+            if (col_count > 1)  output.SetValue(1,  i, Value(result.repo_path));      // repo_path  
+            if (col_count > 2)  output.SetValue(2,  i, Value(result.commit_hash));    // commit_hash
+            if (col_count > 3)  output.SetValue(3,  i, Value(result.tree_hash));      // tree_hash
+            if (col_count > 4)  output.SetValue(4,  i, Value(result.file_path));      // file_path
+            if (col_count > 5)  output.SetValue(5,  i, Value(result.file_ext));       // file_ext
+            if (col_count > 6)  output.SetValue(6,  i, Value(result.ref));            // ref
+            if (col_count > 7)  output.SetValue(7,  i, Value(result.blob_hash));      // blob_hash
+            if (col_count > 8)  output.SetValue(8,  i, Value::INTEGER(result.mode));  // mode
+            if (col_count > 9)  output.SetValue(9,  i, Value(result.kind));           // kind
+            if (col_count > 10) output.SetValue(10, i, Value::BOOLEAN(result.is_text)); // is_text
+            if (col_count > 11) output.SetValue(11, i, Value(result.encoding));       // encoding
+            if (col_count > 12) output.SetValue(12, i, Value::BIGINT(result.size_bytes)); // size_bytes
+            if (col_count > 13) output.SetValue(13, i, Value::BOOLEAN(result.truncated)); // truncated
             
-            if (!result.text.empty()) {
-                output.SetValue(14, i, Value(result.text));       // text
-            } else {
-                FlatVector::SetNull(output.data[14], i, true);
+            // Text column (14)
+            if (col_count > 14) {
+                if (!result.text.empty()) {
+                    output.SetValue(14, i, Value(result.text));       // text
+                } else {
+                    FlatVector::SetNull(output.data[14], i, true);
+                }
             }
             
-            if (!result.blob.empty()) {
-                output.SetValue(15, i, Value::BLOB_RAW(result.blob)); // blob
-            } else {
-                FlatVector::SetNull(output.data[15], i, true);
+            // BLOB column (15) via SetValue (future-proof against non-flat vectors)
+            if (col_count > 15) {
+                if (!result.blob.empty()) {
+                    output.SetValue(15, i, Value::BLOB_RAW(result.blob));
+                } else {
+                    FlatVector::SetNull(output.data[15], i, true);
+                }
             }
         }
         
@@ -3011,32 +2902,32 @@ void RegisterGitReadFunction(DatabaseInstance &db) {
     // For direct calls, use git_read instead
     TableFunctionSet git_read_each_set("git_read_each");
     
-    // Version 1: repo_path_or_uri_with_file (supports both direct calls and LATERAL)
-    TableFunction git_read_each_1({LogicalType::VARCHAR}, GitReadFunction, GitReadEachBind, GitReadInitGlobal, GitReadLocalInit);
+    // Version 1: repo_path_or_uri_with_file (LATERAL-only)
+    TableFunction git_read_each_1({LogicalType::VARCHAR}, nullptr, GitReadEachBind, GitReadInitGlobal, GitReadLocalInit);
     git_read_each_1.in_out_function = GitReadEachFunction;
     git_read_each_1.named_parameters["repo_path"] = LogicalType::VARCHAR;
     git_read_each_set.AddFunction(git_read_each_1);
     
-    // Version 2: repo_path_or_uri_with_file, ref (LATERAL)
-    TableFunction git_read_each_2({LogicalType::VARCHAR, LogicalType::VARCHAR}, GitReadFunction, GitReadEachBind, GitReadInitGlobal, GitReadLocalInit);
+    // Version 2: repo_path_or_uri_with_file, ref (LATERAL-only)
+    TableFunction git_read_each_2({LogicalType::VARCHAR, LogicalType::VARCHAR}, nullptr, GitReadEachBind, GitReadInitGlobal, GitReadLocalInit);
     git_read_each_2.in_out_function = GitReadEachFunction;
     git_read_each_2.named_parameters["repo_path"] = LogicalType::VARCHAR;
     git_read_each_set.AddFunction(git_read_each_2);
     
-    // Version 3: repo_path_or_uri_with_file, ref, max_bytes (LATERAL)
-    TableFunction git_read_each_3({LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BIGINT}, GitReadFunction, GitReadEachBind, GitReadInitGlobal, GitReadLocalInit);
+    // Version 3: repo_path_or_uri_with_file, ref, max_bytes (LATERAL-only)
+    TableFunction git_read_each_3({LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BIGINT}, nullptr, GitReadEachBind, GitReadInitGlobal, GitReadLocalInit);
     git_read_each_3.in_out_function = GitReadEachFunction;
     git_read_each_3.named_parameters["repo_path"] = LogicalType::VARCHAR;
     git_read_each_set.AddFunction(git_read_each_3);
     
-    // Version 4: repo_path_or_uri_with_file, ref, max_bytes, decode_base64 (LATERAL)
-    TableFunction git_read_each_4({LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::VARCHAR}, GitReadFunction, GitReadEachBind, GitReadInitGlobal, GitReadLocalInit);
+    // Version 4: repo_path_or_uri_with_file, ref, max_bytes, decode_base64 (LATERAL-only)
+    TableFunction git_read_each_4({LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::VARCHAR}, nullptr, GitReadEachBind, GitReadInitGlobal, GitReadLocalInit);
     git_read_each_4.in_out_function = GitReadEachFunction;
     git_read_each_4.named_parameters["repo_path"] = LogicalType::VARCHAR;
     git_read_each_set.AddFunction(git_read_each_4);
     
-    // Version 5: repo_path_or_uri_with_file, ref, max_bytes, decode_base64, transcode (LATERAL)
-    TableFunction git_read_each_5({LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::VARCHAR, LogicalType::VARCHAR}, GitReadFunction, GitReadEachBind, GitReadInitGlobal, GitReadLocalInit);
+    // Version 5: repo_path_or_uri_with_file, ref, max_bytes, decode_base64, transcode (LATERAL-only)
+    TableFunction git_read_each_5({LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::VARCHAR, LogicalType::VARCHAR}, nullptr, GitReadEachBind, GitReadInitGlobal, GitReadLocalInit);
     git_read_each_5.in_out_function = GitReadEachFunction;
     git_read_each_5.named_parameters["repo_path"] = LogicalType::VARCHAR;
     git_read_each_set.AddFunction(git_read_each_5);
@@ -3092,6 +2983,8 @@ static void GitUriFunction(DataChunk &args, ExpressionState &state, Vector &resu
     auto file_path_data = UnifiedVectorFormat::GetData<string_t>(file_path_format);
     auto commit_ref_data = UnifiedVectorFormat::GetData<string_t>(commit_ref_format);
     
+    // Ensure result vector is flat for per-row writes (ChatGPT Fix #1)
+    result.SetVectorType(VectorType::FLAT_VECTOR);
     auto result_data = FlatVector::GetData<string_t>(result);
     for (idx_t i = 0; i < args.size(); i++) {
         auto repo_idx = repo_path_format.sel->get_index(i);

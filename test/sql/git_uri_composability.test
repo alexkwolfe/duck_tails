@@ -15,12 +15,12 @@
 # 8. ✅ Proper error messages for invalid URIs
 #
 # Functions tested:
-# - git_tree_each (produces git_file_uri)
-# - git_log_each (consumes git_file_uri)
+# - git_tree_each (produces git_uri)
+# - git_log_each (consumes git_uri)
 # - git_parents_each (consumes git URIs)
 # - git_branches_each (consumes git URIs)
 # - git_tags_each (consumes git URIs)
-# - git_read_each (consumes git_file_uri)
+# - git_read_each (consumes git_uri)
 
 statement ok
 SET autoinstall_extension_repository='/Users/alex/Dev/duck_tails/build/debug/repository';
@@ -34,17 +34,17 @@ SET custom_extension_repository='/Users/alex/Dev/duck_tails/build/debug/reposito
 statement ok
 LOAD duck_tails;
 
-# Test 1: git_tree produces git_file_uri that can be consumed by _each functions
+# Test 1: git_tree produces git_uri that can be consumed by _each functions
 # ================================================================================
 
-# First verify that git_tree produces git_file_uri (with resolved commit hash)
+# First verify that git_tree produces git_uri (with resolved commit hash)
 query II
 SELECT 
-    path, 
-    git_file_uri LIKE 'git://%' as has_uri_format
+    file_path, 
+    git_uri LIKE 'git://%' as has_uri_format
 FROM git_tree('HEAD', repo_path => '/Users/alex/Dev/duck_tails')
-WHERE path LIKE 'README%'
-ORDER BY path
+WHERE file_path LIKE 'README%'
+ORDER BY file_path
 LIMIT 1;
 ----
 README.md	true
@@ -52,19 +52,19 @@ README.md	true
 # Test 2: git_log_each can consume git:// URIs from git_tree
 # ===========================================================
 
-# Test composability: git_tree outputs git_file_uri, git_log_each consumes it
+# Test composability: git_tree outputs git_uri, git_log_each consumes it
 query II
 SELECT 
-    t.path,
+    t.file_path,
     COUNT(l.commit_hash) as commit_count
 FROM git_tree('HEAD', repo_path => '/Users/alex/Dev/duck_tails') t
 CROSS JOIN LATERAL (
     SELECT commit_hash 
-    FROM git_log_each(t.git_file_uri) 
+    FROM git_log_each(t.git_uri) 
     LIMIT 1
 ) l
-WHERE t.path = 'README.md'
-GROUP BY t.path;
+WHERE t.file_path = 'README.md'
+GROUP BY t.file_path;
 ----
 README.md	1
 
@@ -115,19 +115,19 @@ CROSS JOIN LATERAL git_tags_each(r.repo_uri) t;
 ----
 0
 
-# Test 6: git_read_each can consume git_file_uri from git_tree
+# Test 6: git_read_each can consume git_uri from git_tree
 # =============================================================
 
 query II
 SELECT 
-    t.path,
-    LENGTH(r.content) > 0 as has_content
+    t.file_path,
+    LENGTH(r.text) > 0 as has_content
 FROM git_tree('HEAD', repo_path => '/Users/alex/Dev/duck_tails') t
 CROSS JOIN LATERAL (
-    SELECT content 
-    FROM git_read_each(t.git_file_uri)
+    SELECT text 
+    FROM git_read_each(t.git_uri)
 ) r
-WHERE t.path = 'README.md';
+WHERE t.file_path = 'README.md';
 ----
 README.md	true
 
@@ -137,25 +137,25 @@ README.md	true
 # Chain git_tree -> git_log_each -> git_parents_each using URIs
 query II
 WITH tree_files AS (
-    SELECT path, git_file_uri 
+    SELECT file_path, git_uri 
     FROM git_tree('HEAD', repo_path => '/Users/alex/Dev/duck_tails')
-    WHERE path = 'README.md'
+    WHERE file_path = 'README.md'
 ),
 file_commits AS (
     SELECT 
-        tf.path,
+        tf.file_path,
         'git://' || '/Users/alex/Dev/duck_tails' || '@' || l.commit_hash as commit_uri,
         l.commit_hash
     FROM tree_files tf
-    CROSS JOIN LATERAL git_log_each(tf.git_file_uri) l
+    CROSS JOIN LATERAL git_log_each(tf.git_uri) l
     LIMIT 1
 )
 SELECT 
-    fc.path,
+    fc.file_path,
     COUNT(p.parent_hash) >= 0 as has_valid_count
 FROM file_commits fc
 LEFT JOIN LATERAL git_parents_each(fc.commit_uri) p ON true
-GROUP BY fc.path;
+GROUP BY fc.file_path;
 ----
 README.md	true
 
@@ -219,7 +219,7 @@ FROM git_tree_each('git:///Users/alex/Dev/duck_tails@HEAD');
 true
 
 query I
-SELECT LENGTH(content) > 0 as has_content
+SELECT LENGTH(text) > 0 as has_content
 FROM git_read_each('git:///Users/alex/Dev/duck_tails/README.md@HEAD');
 ----
 true

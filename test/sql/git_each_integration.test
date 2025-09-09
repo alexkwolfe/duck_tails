@@ -7,19 +7,19 @@ require duck_tails
 statement ok
 PRAGMA enable_verification
 
-# Test git_uri helper function integration with git_tree git_file_uri
+# Test git_uri helper function integration with git_tree git_uri  
 query T
-SELECT git_file_uri LIKE '%/README.md@' || commit_hash as uri_matches
+SELECT git_uri LIKE '%/README.md@' || commit_hash as uri_matches
 FROM git_tree('test/tmp/main-repo', 'HEAD') 
-WHERE path = 'README.md'
+WHERE file_path = 'README.md'
 ----
 true
 
-# Test git_tree produces valid git_file_uri values
+# Test git_tree produces valid git_uri values
 query T
-SELECT LENGTH(git_file_uri) > 0 as has_uri
+SELECT LENGTH(git_uri) > 0 as has_uri
 FROM git_tree('test/tmp/main-repo', 'HEAD')
-WHERE path = 'README.md'
+WHERE file_path = 'README.md'
 ----
 true
 
@@ -41,7 +41,7 @@ main-repo	main	3
 
 # Test cross-function integration: git_log_each -> git_tree_each
 query II
-SELECT COUNT(*) as file_count, COUNT(DISTINCT t.path) as unique_files
+SELECT COUNT(*) as file_count, COUNT(DISTINCT t.file_path) as unique_files
 FROM git_log_each('test/tmp/main-repo') l,
      LATERAL git_tree_each('test/tmp/main-repo', l.commit_hash) t
 WHERE l.commit_hash IS NOT NULL
@@ -63,7 +63,7 @@ WITH analysis AS (
     SELECT 
         l.repo_path,
         l.commit_hash,
-        COUNT(DISTINCT t.path) as files_in_commit,
+        COUNT(DISTINCT t.file_path) as files_in_commit,
         COUNT(DISTINCT b.branch_name) as branches_count
     FROM git_log_each('test/tmp/main-repo') l
     LEFT JOIN LATERAL git_tree_each('test/tmp/main-repo', l.commit_hash) t ON true

@@ -19,12 +19,12 @@
 # 8. ✅ Proper error messages for invalid URIs
 #
 # Functions tested:
-# - git_tree_each (produces git_file_uri)
-# - git_log_each (consumes git_file_uri)
+# - git_tree_each (produces git_uri)
+# - git_log_each (consumes git_uri)
 # - git_parents_each (consumes git URIs)
 # - git_branches_each (consumes git URIs)
 # - git_tags_each (consumes git URIs)
-# - git_read_each (consumes git_file_uri)
+# - git_read_each (consumes git_uri)
 
 statement ok
 SET autoinstall_extension_repository='/Users/alex/Dev/duck_tails/build/debug/repository';
@@ -45,7 +45,7 @@ CREATE OR REPLACE MACRO FIXTURE_PATH() AS '/var/folders/gg/mzhzcjsj5tv0yrm085bcn
 # Test 1: git_tree produces git_file_uri that can be consumed by _each functions
 # ================================================================================
 
-# First verify that git_tree produces git_file_uri (with resolved commit hash)
+# First verify that git_tree produces git_uri (with resolved commit hash)
 query II
 SELECT 
     file_path, 
@@ -60,7 +60,7 @@ README.md	true
 # Test 2: git_log_each can consume git:// URIs from git_tree
 # ===========================================================
 
-# Test composability: git_tree outputs git_file_uri, git_log_each consumes it
+# Test composability: git_tree outputs git_uri, git_log_each consumes it
 query II
 SELECT 
     t.file_path,
@@ -123,7 +123,7 @@ CROSS JOIN LATERAL git_tags_each(r.repo_uri) t;
 ----
 true
 
-# Test 6: git_read_each can consume git_file_uri from git_tree
+# Test 6: git_read_each can consume git_uri from git_tree
 # =============================================================
 
 query II
