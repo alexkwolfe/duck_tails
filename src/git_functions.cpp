@@ -605,18 +605,6 @@ static string ExtractFileExtension(const string &file_path) {
     return "";  // No extension found
 }
 
-// Helper function to parse git URI components
-static void ParseGitUriComponents(const string &git_uri, string &file_path, string &ref) {
-    try {
-        auto git_path = GitPath::Parse(git_uri);
-        file_path = git_path.file_path;
-        ref = git_path.revision.empty() ? "HEAD" : git_path.revision;
-    } catch (const std::exception &e) {
-        // Fallback if parsing fails
-        file_path = "";
-        ref = "HEAD";
-    }
-}
 
 static void traverse_tree(git_repository *repo, git_tree *tree, const string &base, vector<GitTreeRow> &out, 
                           const string &commit_hash, timestamp_t commit_date, const string &repo_path) {
@@ -961,122 +949,6 @@ void GitTreeFunction(ClientContext &context, TableFunctionInput &data_p, DataChu
     bind_data.current_index += count;
 }
 
-// Git Tree In-Out Function for LATERAL support
-struct GitTreeInOutState : public LocalTableFunctionState {
-    GitTreeInOutState() = default;
-    
-    bool initialized_row = false;
-    idx_t current_input_row = 0;
-    idx_t current_output_row = 0;
-    vector<GitTreeRow> current_rows;
-    string repo_path;
-};
-
-static unique_ptr<LocalTableFunctionState> GitTreeInOutInit(ExecutionContext &context,
-                                                           TableFunctionInitInput &input,
-                                                           GlobalTableFunctionState *global_state) {
-    auto state = make_uniq<GitTreeInOutState>();
-    auto &bind_data = input.bind_data->Cast<GitTreeFunctionData>();
-    state->repo_path = bind_data.repo_path;
-    return std::move(state);
-}
-
-static void ProcessCommitForInOut(const string &commit_hash, const string &repo_path, vector<GitTreeRow> &rows) {
-    // libgit2 is initialized at extension load time
-    git_repository *repo = nullptr;
-    
-    try {
-        if (git_repository_open(&repo, repo_path.c_str()) != 0) {
-                return;
-        }
-        
-        git_oid oid;
-        if (git_oid_fromstr(&oid, commit_hash.c_str()) != 0) {
-            git_repository_free(repo);
-                return;
-        }
-        
-        git_commit *commit = nullptr;
-        if (git_commit_lookup(&commit, repo, &oid) != 0) {
-            git_repository_free(repo);
-                return;
-        }
-        
-        timestamp_t commit_date = Timestamp::FromEpochSeconds(git_commit_time(commit));
-        
-        git_tree *tree = nullptr;
-        if (git_commit_tree(&tree, commit) != 0) {
-            git_commit_free(commit);
-            git_repository_free(repo);
-                return;
-        }
-        
-        // Use existing traverse_tree function to populate rows
-        traverse_tree(repo, tree, "", rows, commit_hash, commit_date, repo_path);
-        
-        git_tree_free(tree);
-        git_commit_free(commit);
-        git_repository_free(repo);
-        
-    } catch (...) {
-        if (repo) git_repository_free(repo);
-    }
-}
-
-static OperatorResultType GitTreeInOutFunction(ExecutionContext &context, TableFunctionInput &data_p, 
-                                              DataChunk &input, DataChunk &output) {
-    auto &state = data_p.local_state->Cast<GitTreeInOutState>();
-    
-    while (true) {
-        if (!state.initialized_row) {
-            // Initialize for the current input row
-            if (state.current_input_row >= input.size()) {
-                // Ran out of input rows
-                state.current_input_row = 0;
-                state.initialized_row = false;
-                return OperatorResultType::NEED_MORE_INPUT;
-            }
-            
-            // Get the commit hash for this row
-            input.Flatten();
-            if (FlatVector::IsNull(input.data[0], state.current_input_row)) {
-                // Null commit hash - skip this row
-                state.current_input_row++;
-                continue;
-            }
-            
-            string commit_hash = FlatVector::GetValue<string>(input.data[0], state.current_input_row);
-            
-            // Process the git tree for this commit
-            state.current_rows.clear();
-            ProcessCommitForInOut(commit_hash, state.repo_path, state.current_rows);
-            
-            state.initialized_row = true;
-            state.current_output_row = 0;
-        }
-        
-        if (state.current_output_row >= state.current_rows.size()) {
-            // Finished outputting all rows for this input row, move to next
-            state.current_input_row++;
-            state.initialized_row = false;
-            continue;
-        }
-        
-        // Output rows for the current commit
-        idx_t remaining = state.current_rows.size() - state.current_output_row;
-        idx_t count = MinValue<idx_t>(remaining, STANDARD_VECTOR_SIZE);
-        
-        for (idx_t i = 0; i < count; i++) {
-            auto &row = state.current_rows[state.current_output_row + i];
-            OutputGitTreeRow(output, i, row, state.repo_path);
-        }
-        
-        output.SetCardinality(count);
-        state.current_output_row += count;
-        
-        return OperatorResultType::HAVE_MORE_OUTPUT;
-    }
-}
 
 //===--------------------------------------------------------------------===//
 // Git Parents Function  
@@ -1518,7 +1390,6 @@ static void ProcessBranchesForInOut(const string &input_repo_path, const string 
 // LATERAL git_branches_each function - processes dynamic repository paths
 static OperatorResultType GitBranchesEachFunction(ExecutionContext &context, TableFunctionInput &data_p, 
                                                  DataChunk &input, DataChunk &output) {
-    auto &bind_data = data_p.bind_data->Cast<GitBranchesFunctionData>();
     auto &state = data_p.local_state->Cast<GitBranchesLocalState>();
     
     // Declare resolved_repo_path at function scope so it's accessible in output loop
@@ -2469,78 +2340,6 @@ static unique_ptr<GlobalTableFunctionState> GitReadInitGlobal(ClientContext &con
     return make_uniq<GitReadGlobalState>();
 }
 
-// Helper function to parse git:// URI format
-static bool ParseGitURI(const string& uri, string& path, string& commit_hash) {
-    // Expected format: git://path/to/file@commit_hash
-    if (!StringUtil::StartsWith(uri, "git://")) {
-        return false;
-    }
-    
-    auto at_pos = uri.find_last_of('@');
-    if (at_pos == string::npos) {
-        return false;
-    }
-    
-    path = uri.substr(6, at_pos - 6);  // Remove "git://" prefix
-    commit_hash = uri.substr(at_pos + 1);
-    
-    return true;
-}
-
-// Helper function to detect if content is text
-static bool IsTextContent(const char* data, size_t size) {
-    // Check for null bytes (strong indicator of binary data)
-    for (size_t i = 0; i < size; i++) {
-        if (data[i] == 0) {
-            return false;
-        }
-    }
-    
-    // Check for valid UTF-8 sequences and reasonable control characters
-    size_t i = 0;
-    while (i < size) {
-        unsigned char c = static_cast<unsigned char>(data[i]);
-        
-        // ASCII printable characters and common whitespace
-        if (c < 128) {
-            // Allow printable ASCII and common control chars: tab, newline, carriage return
-            if (c >= 32 || c == 9 || c == 10 || c == 13) {
-                i++;
-                continue;
-            } else {
-                return false;  // Unusual control character
-            }
-        }
-        
-        // Check for valid UTF-8 multi-byte sequences
-        int bytes_in_sequence = 0;
-        if ((c & 0xE0) == 0xC0) {  // 110xxxxx - 2 byte sequence
-            bytes_in_sequence = 2;
-        } else if ((c & 0xF0) == 0xE0) {  // 1110xxxx - 3 byte sequence
-            bytes_in_sequence = 3;
-        } else if ((c & 0xF8) == 0xF0) {  // 11110xxx - 4 byte sequence
-            bytes_in_sequence = 4;
-        } else {
-            return false;  // Invalid UTF-8 start byte
-        }
-        
-        // Validate the continuation bytes
-        if (i + bytes_in_sequence > size) {
-            return false;  // Incomplete sequence
-        }
-        
-        for (int j = 1; j < bytes_in_sequence; j++) {
-            unsigned char continuation = static_cast<unsigned char>(data[i + j]);
-            if ((continuation & 0xC0) != 0x80) {  // Must be 10xxxxxx
-                return false;  // Invalid continuation byte
-            }
-        }
-        
-        i += bytes_in_sequence;
-    }
-    
-    return true;
-}
 
 // Helper function to process a git:// URI and extract content
 static void ProcessGitURI(const string& uri, const GitReadBindData& bind_data, 
