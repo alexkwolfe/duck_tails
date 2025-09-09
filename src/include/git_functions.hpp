@@ -40,6 +40,13 @@ struct GitLogRow {
     string message;
     uint32_t parent_count;
     string tree_hash;
+    
+    // Constructor to ensure proper initialization
+    GitLogRow() : 
+        repo_path(""), commit_hash(""), author_name(""), author_email(""),
+        committer_name(""), committer_email(""), 
+        author_date(timestamp_t(0)), commit_date(timestamp_t(0)),
+        message(""), parent_count(0), tree_hash("") {}
 };
 
 // Local state for git_log_each LATERAL processing
@@ -60,6 +67,11 @@ struct GitBranchesRow {
     string commit_hash;
     bool is_current;
     bool is_remote;
+    
+    // Constructor to ensure proper initialization
+    GitBranchesRow() : 
+        repo_path(""), branch_name(""), commit_hash(""),
+        is_current(false), is_remote(false) {}
 };
 
 // Local state for git_branches_each LATERAL processing
@@ -101,6 +113,11 @@ struct GitTagsRow {
     timestamp_t tagger_date;
     string message;
     bool is_annotated;
+    
+    // Constructor to ensure proper initialization
+    GitTagsRow() : 
+        repo_path(""), tag_name(""), commit_hash(""), tagger_name(""),
+        tagger_date(timestamp_t(0)), message(""), is_annotated(false) {}
 };
 
 // Local state for git_tags_each LATERAL processing

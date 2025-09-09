@@ -1,0 +1,10 @@
+# Minimal test - git_read direct call (git_read_each is LATERAL-only)  
+statement ok
+LOAD duck_tails;
+
+# Direct call - no LATERAL, no complex setup
+query I
+SELECT LENGTH(text) > 0 as has_content
+FROM git_read('git:///var/folders/gg/mzhzcjsj5tv0yrm085bcntg00000gn/T/duck_tails_test_YbKdnW/main-repo/README.md@HEAD');
+----
+true

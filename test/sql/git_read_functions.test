@@ -9,7 +9,7 @@ PRAGMA enable_verification
 
 # Test basic git_read function with a simple file
 query TITTITTTT
-SELECT uri, mode, kind, is_text, encoding, size_bytes > 0 as has_size, truncated, 
+SELECT git_uri, mode, kind, is_text, encoding, size_bytes > 0 as has_size, truncated, 
        text IS NOT NULL as has_text, blob IS NULL as no_blob
 FROM git_read('git://README.md@HEAD')
 ----
@@ -56,13 +56,13 @@ SELECT kind FROM git_read_each('git://README.md@HEAD')
 ----
 file
 
-# Verify schema has 9 columns (removed redundant note field)
+# Verify schema has 16 columns (expanded schema)
 query I
 SELECT COUNT(*) FROM (
   DESCRIBE (SELECT * FROM git_read('git://README.md@HEAD'))
 )
 ----
-9
+16
 
 # Test that git_read and git_read_each both execute properly
 statement ok

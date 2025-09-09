@@ -7,15 +7,15 @@ require duck_tails
 statement ok
 PRAGMA enable_verification
 
-# Test direct git_read_each calls (basic functionality)
+# Test direct git_read calls (basic functionality)
 query T
-SELECT kind FROM git_read_each('git://README.md@HEAD')
+SELECT kind FROM git_read('git://README.md@HEAD')
 ----
 file
 
-# Test git_read_each with parameters
+# Test git_read with parameters (uri, max_bytes)
 query TI
-SELECT kind, size_bytes > 0 as has_size FROM git_read_each('git://README.md@HEAD', 'HEAD', 1000)
+SELECT kind, size_bytes > 0 as has_size FROM git_read('git://README.md@HEAD', 1000)
 ----
 file	true
 
@@ -61,15 +61,15 @@ FROM test_uris t, LATERAL git_read_each(t.uri, 'HEAD', 100) r
 ----
 git://README.md@HEAD	file	false
 
-# Test git_read_each error handling - invalid URI format
+# Test git_read error handling - invalid URI format
 statement error
-SELECT * FROM git_read_each('invalid://uri')
+SELECT * FROM git_read('invalid://uri')
 ----
 IO Error: git_read: file not found
 
-# Test git_read_each error handling - non-existent file
+# Test git_read error handling - non-existent file
 statement error
-SELECT * FROM git_read_each('git://non_existent_file.txt@HEAD')
+SELECT * FROM git_read('git://non_existent_file.txt@HEAD')
 ----
 IO Error: git_read: file not found 'non_existent_file.txt' in commit 'HEAD'
 
@@ -91,18 +91,18 @@ FROM repos r, commits c, LATERAL git_read_each('git://' || r.name || '@' || c.ha
 ----
 README.md	HEAD	file
 
-# Test git_read_each schema consistency (should have 9 columns)
+# Test git_read schema consistency (should have 16 columns)
 query I
 SELECT COUNT(*) FROM (
-  DESCRIBE (SELECT * FROM git_read_each('git://README.md@HEAD'))
+  DESCRIBE (SELECT * FROM git_read('git://README.md@HEAD'))
 )
 ----
-9
+16
 
-# Test git_read_each return columns match expected schema
+# Test git_read return columns match expected schema
 statement ok
-SELECT uri, mode, kind, is_text, encoding, size_bytes, truncated, text, blob
-FROM git_read_each('git://README.md@HEAD')
+SELECT git_uri, mode, kind, is_text, encoding, size_bytes, truncated, text, blob
+FROM git_read('git://README.md@HEAD')
 
 # Test LATERAL git_read_each with aggregate functions
 query I
@@ -127,9 +127,9 @@ WHERE t.uri LIKE '%README%'
 ----
 file
 
-# Test git_read_each with named parameters
+# Test git_read with named parameters
 query T
-SELECT kind FROM git_read_each('git://README.md@HEAD', repo_path := '.')
+SELECT kind FROM git_read('git://README.md@HEAD', repo_path := '.')
 ----
 file
 

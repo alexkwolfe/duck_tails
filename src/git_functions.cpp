@@ -2446,6 +2446,13 @@ struct GitReadLocalState : public LocalTableFunctionState {
         bool truncated;          // Whether content was truncated
         string text;             // Text content
         string blob;             // Base64 encoded binary content
+        
+        // Constructor to ensure proper initialization
+        ReadResult() : 
+            git_uri(""), repo_path(""), commit_hash(""), tree_hash(""),
+            file_path(""), file_ext(""), ref(""), blob_hash(""),
+            mode(0), kind("blob"), is_text(true), encoding("utf8"),
+            size_bytes(0), truncated(false), text(""), blob("") {}
     };
     
     vector<ReadResult> current_results;
@@ -2888,7 +2895,42 @@ static void GitReadFunction(ClientContext &context, TableFunctionInput &input, D
 static unique_ptr<FunctionData> GitReadEachBind(ClientContext &context, TableFunctionBindInput &input,
                                           vector<LogicalType> &return_types, vector<string> &names) {
     
-    // Set default parameters - repo_path_or_uri_with_file comes from input DataChunk at runtime
+    // Check if this is a direct call (has input.inputs[0]) or LATERAL call (input comes at runtime)
+    string uri_for_direct_call = "";
+    bool is_direct_call = false;
+    
+    if (!input.inputs.empty() && !input.inputs[0].IsNull()) {
+        // Direct call - process the URI/path and optional ref
+        string first_param = input.inputs[0].GetValue<string>();
+        string ref = "HEAD";  // Default ref
+        
+        // Check for explicit ref parameter in direct call
+        if (input.inputs.size() >= 2 && !input.inputs[1].IsNull() && 
+            input.inputs[1].type().id() == LogicalTypeId::VARCHAR) {
+            ref = input.inputs[1].GetValue<string>();
+        }
+        
+        // Build complete URI for direct call
+        if (StringUtil::StartsWith(first_param, "git://")) {
+            // Validate no conflicting refs
+            try {
+                auto git_path = GitPath::Parse(first_param);
+                if (!git_path.revision.empty() && ref != "HEAD") {
+                    throw BinderException("git_read_each: Conflicting ref specifications: git:// URI contains '@%s' but function parameter specifies '%s'", 
+                                        git_path.revision, ref);
+                }
+            } catch (const std::exception &e) {
+                // If parsing fails, let ProcessGitURI handle the error
+            }
+            uri_for_direct_call = first_param;
+        } else {
+            // Filesystem path - build git:// URI with ref
+            uri_for_direct_call = "git://" + first_param + "@" + ref;
+        }
+        is_direct_call = true;
+    }
+    
+    // Set default parameters
     int64_t max_bytes = -1;  // No limit by default
     string decode_base64 = "auto";
     string transcode = "utf8";
@@ -2898,17 +2940,24 @@ static unique_ptr<FunctionData> GitReadEachBind(ClientContext &context, TableFun
     // Handle optional parameters with new unified signature:
     // repo_path_or_uri_with_file (from LATERAL), [ref], [max_bytes], [decode_base64], [transcode]
     // The ref parameter is now at index 1, max_bytes at index 2
-    if (input.inputs.size() >= 3 && !input.inputs[2].IsNull()) {
-        max_bytes = input.inputs[2].GetValue<int64_t>();
+    // Note: For direct calls with ref, the parameter indices shift
+    int param_offset = is_direct_call && input.inputs.size() >= 2 && 
+                      input.inputs[1].type().id() == LogicalTypeId::VARCHAR ? 2 : 1;
+    
+    if (input.inputs.size() > param_offset && !input.inputs[param_offset].IsNull() && 
+        input.inputs[param_offset].type().id() == LogicalTypeId::BIGINT) {
+        max_bytes = input.inputs[param_offset].GetValue<int64_t>();
+        param_offset++;
     }
-    if (input.inputs.size() >= 4 && !input.inputs[3].IsNull()) {
-        decode_base64 = input.inputs[3].GetValue<string>();
+    if (input.inputs.size() > param_offset && !input.inputs[param_offset].IsNull()) {
+        decode_base64 = input.inputs[param_offset].GetValue<string>();
+        param_offset++;
     }
-    if (input.inputs.size() >= 5 && !input.inputs[4].IsNull()) {
-        transcode = input.inputs[4].GetValue<string>();
+    if (input.inputs.size() > param_offset + 1 && !input.inputs[param_offset + 1].IsNull()) {
+        transcode = input.inputs[param_offset + 1].GetValue<string>();
     }
-    if (input.inputs.size() >= 6 && !input.inputs[5].IsNull()) {
-        filters = input.inputs[5].GetValue<string>();
+    if (input.inputs.size() > param_offset + 2 && !input.inputs[param_offset + 2].IsNull()) {
+        filters = input.inputs[param_offset + 2].GetValue<string>();
     }
     
     // Check for repo_path named parameter
@@ -2943,7 +2992,8 @@ static unique_ptr<FunctionData> GitReadEachBind(ClientContext &context, TableFun
              "truncated", "text", "blob"};
     
     // Don't store URI in bind_data - it always comes from input DataChunk for LATERAL functions
-    return make_uniq<GitReadBindData>(max_bytes, decode_base64, transcode, filters, repo_path, "");
+    // Store the URI if this is a direct call, otherwise empty string for LATERAL
+    return make_uniq<GitReadBindData>(max_bytes, decode_base64, transcode, filters, repo_path, uri_for_direct_call);
 }
 
 static unique_ptr<LocalTableFunctionState> GitReadLocalInit(ExecutionContext &context, 
@@ -2952,13 +3002,32 @@ static unique_ptr<LocalTableFunctionState> GitReadLocalInit(ExecutionContext &co
     return make_uniq<GitReadLocalState>();
 }
 
+// git_read_each is ONLY for LATERAL joins - processes input from another table
+// For direct calls, use git_read instead
 static OperatorResultType GitReadEachFunction(ExecutionContext &context, TableFunctionInput &data_p, 
                                         DataChunk &input, DataChunk &output) {
     auto &bind_data = data_p.bind_data->Cast<GitReadBindData>();
     auto &state = data_p.local_state->Cast<GitReadLocalState>();
     
+    // Handle direct calls (literal URI provided) vs LATERAL calls (URI from input)
+    if (!bind_data.uri.empty()) {
+        // Direct call mode - process the literal URI like git_read
+        // This handles cases like: SELECT * FROM git_read_each('git://file@HEAD')
+        if (!state.initialized_row) {
+            GitReadLocalState::ReadResult result;
+            ProcessGitURI(bind_data.uri, bind_data, result);
+            state.current_results.clear();
+            state.current_results.push_back(result);
+            
+            state.initialized_row = true;
+            state.current_output_row = 0;
+        }
+    }
+    
+    // LATERAL mode - process input chunk
     while (true) {
         if (!state.initialized_row) {
+            
             // initialize for the current input row
             if (state.current_input_row >= input.size()) {
                 // ran out of rows
@@ -2967,7 +3036,7 @@ static OperatorResultType GitReadEachFunction(ExecutionContext &context, TableFu
                 return OperatorResultType::NEED_MORE_INPUT;
             }
             
-            // LATERAL function: ALWAYS extract URI from input DataChunk
+            // LATERAL function: extract URI from input DataChunk
             input.Flatten();
             
             // Check if input has columns and data
@@ -2991,47 +3060,47 @@ static OperatorResultType GitReadEachFunction(ExecutionContext &context, TableFu
             
             // Get the string_t directly and convert to string
             auto string_t_value = data[state.current_input_row];
-            string first_param(string_t_value.GetData(), string_t_value.GetSize());
+            string first_param = string(string_t_value.GetData(), string_t_value.GetSize());
             
             if (first_param.empty()) {
                 throw BinderException("git_read_each: received empty repo_path_or_uri from input");
             }
             
-            // Convert to git:// URI if needed (same logic as GitReadBind)
+            // Build URI from LATERAL input
             string uri;
             if (StringUtil::StartsWith(first_param, "git://")) {
-                // Check for ref conflict validation
-                string explicit_ref = "";
-                if (input.ColumnCount() > 1 && !FlatVector::IsNull(input.data[1], state.current_input_row)) {
-                    auto ref_data = FlatVector::GetData<string_t>(input.data[1]);
-                    if (ref_data) {
-                        auto ref_string_t = ref_data[state.current_input_row];
-                        explicit_ref = string(ref_string_t.GetData(), ref_string_t.GetSize());
-                    }
-                }
-                
-                // Check if git:// URI has embedded ref and explicit ref was also provided
-                if (!explicit_ref.empty()) {
-                    try {
-                        auto git_path = GitPath::Parse(first_param);
-                        if (!git_path.revision.empty()) {
-                            throw BinderException("git_read_each: Conflicting ref specifications: git:// URI contains '@%s' but function parameter specifies '%s'", 
-                                                git_path.revision, explicit_ref);
+                // git:// URI from LATERAL input
+                // Check for ref conflict if there's a second column
+                if (input.ColumnCount() > 1) {
+                    string explicit_ref = "";
+                    if (!FlatVector::IsNull(input.data[1], state.current_input_row)) {
+                        auto ref_data = FlatVector::GetData<string_t>(input.data[1]);
+                        if (ref_data) {
+                            auto ref_string_t = ref_data[state.current_input_row];
+                            explicit_ref = string(ref_string_t.GetData(), ref_string_t.GetSize());
                         }
-                    } catch (const std::exception &e) {
-                        // If parsing fails, let ProcessGitURI handle the error
+                    }
+                    
+                    // Check if git:// URI has embedded ref and explicit ref was also provided
+                    if (!explicit_ref.empty()) {
+                        try {
+                            auto git_path = GitPath::Parse(first_param);
+                            if (!git_path.revision.empty()) {
+                                throw BinderException("git_read_each: Conflicting ref specifications: git:// URI contains '@%s' but function parameter specifies '%s'", 
+                                                    git_path.revision, explicit_ref);
+                            }
+                        } catch (const std::exception &e) {
+                            // If parsing fails, let ProcessGitURI handle the error
+                        }
                     }
                 }
                 
                 uri = first_param;  // Use git:// URI as-is
             } else {
-                // Filesystem path - need to convert to git:// URI
-                // Create a mock input for unified parameter parsing
-                vector<Value> mock_inputs;
-                mock_inputs.push_back(Value(first_param));
-                
-                // Add optional ref parameter if available from input
+                // Filesystem path from LATERAL input - need to convert to git:// URI
                 string ref = "HEAD";  // Default ref
+                
+                // Read ref from input if available (LATERAL mode only)
                 if (input.ColumnCount() > 1 && !FlatVector::IsNull(input.data[1], state.current_input_row)) {
                     auto ref_data = FlatVector::GetData<string_t>(input.data[1]);
                     if (ref_data) {
@@ -3040,8 +3109,7 @@ static OperatorResultType GitReadEachFunction(ExecutionContext &context, TableFu
                     }
                 }
                 
-                // Simply pass the path as a git:// URI and let ProcessGitURI handle it
-                // ProcessGitURI will call GitPath::Parse which does proper repository discovery
+                // Build git:// URI with ref
                 uri = "git://" + first_param + "@" + ref;
             }
             
@@ -3055,46 +3123,51 @@ static OperatorResultType GitReadEachFunction(ExecutionContext &context, TableFu
             state.current_output_row = 0;
         }
         
-        // Output results for current input row
-        idx_t output_count = 0;
-        while (state.current_output_row < state.current_results.size() && output_count < STANDARD_VECTOR_SIZE) {
-            auto &result = state.current_results[state.current_output_row];
+        // Output results for current input row (LATERAL mode)
+        // Compute how many rows we can output this call
+        idx_t remaining = state.current_results.size() - state.current_output_row;
+        idx_t count = MinValue<idx_t>(remaining, STANDARD_VECTOR_SIZE);
+        
+        // Important: set cardinality first to properly initialize the chunk's vectors
+        output.SetCardinality(count);
+        
+        for (idx_t i = 0; i < count; i++) {
+            auto &result = state.current_results[state.current_output_row + i];
             
-            // Fill output columns
-            FlatVector::GetData<string_t>(output.data[0])[output_count] = 
-                StringVector::AddString(output.data[0], result.git_uri);
-            FlatVector::GetData<int32_t>(output.data[1])[output_count] = result.mode;
-            FlatVector::GetData<string_t>(output.data[2])[output_count] = 
-                StringVector::AddString(output.data[2], result.kind);
-            FlatVector::GetData<bool>(output.data[3])[output_count] = result.is_text;
-            FlatVector::GetData<string_t>(output.data[4])[output_count] = 
-                StringVector::AddString(output.data[4], result.encoding);
-            FlatVector::GetData<int64_t>(output.data[5])[output_count] = result.size_bytes;
-            FlatVector::GetData<bool>(output.data[6])[output_count] = result.truncated;
+            // Use SetValue for safe column filling - matches 16-column schema from GitReadEachBind
+            output.SetValue(0,  i, Value(result.git_uri));        // git_uri
+            output.SetValue(1,  i, Value(result.repo_path));      // repo_path  
+            output.SetValue(2,  i, Value(result.commit_hash));    // commit_hash
+            output.SetValue(3,  i, Value(result.tree_hash));      // tree_hash
+            output.SetValue(4,  i, Value(result.file_path));      // file_path
+            output.SetValue(5,  i, Value(result.file_ext));       // file_ext
+            output.SetValue(6,  i, Value(result.ref));            // ref
+            output.SetValue(7,  i, Value(result.blob_hash));      // blob_hash
+            output.SetValue(8,  i, Value::INTEGER(result.mode));  // mode
+            output.SetValue(9,  i, Value(result.kind));           // kind
+            output.SetValue(10, i, Value::BOOLEAN(result.is_text)); // is_text
+            output.SetValue(11, i, Value(result.encoding));       // encoding
+            output.SetValue(12, i, Value::BIGINT(result.size_bytes)); // size_bytes
+            output.SetValue(13, i, Value::BOOLEAN(result.truncated)); // truncated
             
             if (!result.text.empty()) {
-                FlatVector::GetData<string_t>(output.data[7])[output_count] = 
-                    StringVector::AddString(output.data[7], result.text);
+                output.SetValue(14, i, Value(result.text));       // text
             } else {
-                FlatVector::SetNull(output.data[7], output_count, true);
+                FlatVector::SetNull(output.data[14], i, true);
             }
             
             if (!result.blob.empty()) {
-                FlatVector::GetData<string_t>(output.data[8])[output_count] = 
-                    StringVector::AddStringOrBlob(output.data[8], result.blob);
+                output.SetValue(15, i, Value::BLOB_RAW(result.blob)); // blob
             } else {
-                FlatVector::SetNull(output.data[8], output_count, true);
+                FlatVector::SetNull(output.data[15], i, true);
             }
-            
-            output_count++;
-            state.current_output_row++;
         }
         
-        if (output_count > 0) {
-            output.SetCardinality(output_count);
-            
+        state.current_output_row += count;
+        
+        if (count > 0) {
             if (state.current_output_row >= state.current_results.size()) {
-                // Done with this input row, move to next
+                // Done with this input row - move to next
                 state.current_input_row++;
                 state.initialized_row = false;
             }
@@ -3135,36 +3208,36 @@ void RegisterGitReadFunction(DatabaseInstance &db) {
     
     ExtensionUtil::RegisterFunction(db, git_read_set);
     
-    // LATERAL git_read_each function (first param comes from LATERAL context)
-    // New unified signature: git_read_each(repo_path_or_uri_with_file, [ref], [max_bytes], [other_options...])
+    // git_read_each is ONLY for LATERAL joins - first param comes from LATERAL context
+    // For direct calls, use git_read instead
     TableFunctionSet git_read_each_set("git_read_each");
     
-    // Version 1: repo_path_or_uri_with_file only
-    TableFunction git_read_each_1({LogicalType::VARCHAR}, nullptr, GitReadEachBind, nullptr, GitReadLocalInit);
+    // Version 1: repo_path_or_uri_with_file (supports both direct calls and LATERAL)
+    TableFunction git_read_each_1({LogicalType::VARCHAR}, GitReadFunction, GitReadEachBind, GitReadInitGlobal, GitReadLocalInit);
     git_read_each_1.in_out_function = GitReadEachFunction;
     git_read_each_1.named_parameters["repo_path"] = LogicalType::VARCHAR;
     git_read_each_set.AddFunction(git_read_each_1);
     
-    // Version 2: repo_path_or_uri_with_file, ref
-    TableFunction git_read_each_2({LogicalType::VARCHAR, LogicalType::VARCHAR}, nullptr, GitReadEachBind, nullptr, GitReadLocalInit);
+    // Version 2: repo_path_or_uri_with_file, ref (LATERAL)
+    TableFunction git_read_each_2({LogicalType::VARCHAR, LogicalType::VARCHAR}, GitReadFunction, GitReadEachBind, GitReadInitGlobal, GitReadLocalInit);
     git_read_each_2.in_out_function = GitReadEachFunction;
     git_read_each_2.named_parameters["repo_path"] = LogicalType::VARCHAR;
     git_read_each_set.AddFunction(git_read_each_2);
     
-    // Version 3: repo_path_or_uri_with_file, ref, max_bytes
-    TableFunction git_read_each_3({LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BIGINT}, nullptr, GitReadEachBind, nullptr, GitReadLocalInit);
+    // Version 3: repo_path_or_uri_with_file, ref, max_bytes (LATERAL)
+    TableFunction git_read_each_3({LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BIGINT}, GitReadFunction, GitReadEachBind, GitReadInitGlobal, GitReadLocalInit);
     git_read_each_3.in_out_function = GitReadEachFunction;
     git_read_each_3.named_parameters["repo_path"] = LogicalType::VARCHAR;
     git_read_each_set.AddFunction(git_read_each_3);
     
-    // Version 4: repo_path_or_uri_with_file, ref, max_bytes, decode_base64
-    TableFunction git_read_each_4({LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::VARCHAR}, nullptr, GitReadEachBind, nullptr, GitReadLocalInit);
+    // Version 4: repo_path_or_uri_with_file, ref, max_bytes, decode_base64 (LATERAL)
+    TableFunction git_read_each_4({LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::VARCHAR}, GitReadFunction, GitReadEachBind, GitReadInitGlobal, GitReadLocalInit);
     git_read_each_4.in_out_function = GitReadEachFunction;
     git_read_each_4.named_parameters["repo_path"] = LogicalType::VARCHAR;
     git_read_each_set.AddFunction(git_read_each_4);
     
-    // Version 5: repo_path_or_uri_with_file, ref, max_bytes, decode_base64, transcode
-    TableFunction git_read_each_5({LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::VARCHAR, LogicalType::VARCHAR}, nullptr, GitReadEachBind, nullptr, GitReadLocalInit);
+    // Version 5: repo_path_or_uri_with_file, ref, max_bytes, decode_base64, transcode (LATERAL)
+    TableFunction git_read_each_5({LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::VARCHAR, LogicalType::VARCHAR}, GitReadFunction, GitReadEachBind, GitReadInitGlobal, GitReadLocalInit);
     git_read_each_5.in_out_function = GitReadEachFunction;
     git_read_each_5.named_parameters["repo_path"] = LogicalType::VARCHAR;
     git_read_each_set.AddFunction(git_read_each_5);
